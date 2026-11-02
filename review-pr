@@ -23,6 +23,7 @@ Options:
       --quiet          Do not stream the model's output; show progress only
       --new-job        Always submit a new job, even if a review server is running
       --server         Require a running review server (see review-server)
+      --start-server   Start a review server (up to 8h) if none is running, then send the review to it
   -h, --help           Show this help
 
 Examples:
@@ -32,6 +33,7 @@ Examples:
 
 If a review server is running (review-server start), reviews are sent to it instead of
 submitting a new job, so the model does not have to be loaded each time.
+--start-server starts one first when none is running (on -q's queue if given).
 EOF
 }
 
@@ -39,7 +41,7 @@ die() { echo "review-pr: $*" >&2; exit 1; }
 
 ROOT=$(cd "$(dirname "$(realpath "$0")")" && pwd)
 MODEL=flint:40b
-OUTPUT= POST=0 WAIT=1 INTERACTIVE=0 QUIET=0 NEW_JOB=0 REQUIRE_SERVER=0 SERVER_DIR=
+OUTPUT= POST=0 WAIT=1 INTERACTIVE=0 QUIET=0 NEW_JOB=0 REQUIRE_SERVER=0 START_SERVER=0 SERVER_DIR=
 REPO= PR=
 ARGS=()
 while (( $# )); do
@@ -55,6 +57,7 @@ while (( $# )); do
     --quiet)     QUIET=1; shift ;;
     --new-job)   NEW_JOB=1; shift ;;
     --server)    REQUIRE_SERVER=1; shift ;;
+    --start-server) START_SERVER=1; shift ;;
     -h|--help)   usage; exit 0 ;;
     -*)          usage >&2; die "unknown option: $1" ;;
     *)           ARGS+=("$1"); shift ;;
@@ -75,6 +78,7 @@ else
 fi
 command -v gh > /dev/null || die "gh not found"
 (( NEW_JOB && REQUIRE_SERVER )) && die "--new-job and --server cannot be used together"
+(( NEW_JOB && START_SERVER )) && die "--new-job and --start-server cannot be used together"
 . "$ROOT/jobs/server_common.sh"
 USER_QUEUE=${QUEUE:-}                 # -q で明示されたキュー(サーバを選ぶときに合わせる)
 
@@ -207,6 +211,19 @@ if (( !NEW_JOB )) && [ -z "$SERVER_DIR" ]; then
     fi
     SERVER_DIR=$d; break
   done
+fi
+# --start-server: 合うサーバがなければ起動し、モデルを読み込み終わるまで待つ
+if (( START_SERVER )) && [ -z "$SERVER_DIR" ]; then
+  echo "${DIM}No review server is running on $QUEUE; starting one (up to 8h)${RESET}" >&2
+  # 待っている間の Ctrl-C は review-server にも届く。サーバは起動を続けるので、この依頼だけやめる
+  trap 'echo "Stopped; the server keeps starting (check with: review-server status). Run review-pr again to use it." >&2; rm -rf "$RUN"; exit 130' INT
+  "$ROOT/review-server" start -q "$QUEUE" -g "$NGPUS" ${HOST:+-H "$HOST"} -m "$MODEL" \
+    || { rm -rf "$RUN"; die "could not start a review server"; }
+  trap - INT
+  for d in $(list_servers); do
+    if server_alive "$d" && [ "$(cat "$d/queue_name")" = "$QUEUE" ]; then SERVER_DIR=$d; break; fi
+  done
+  [ -n "$SERVER_DIR" ] || { rm -rf "$RUN"; die "the review server started but cannot be found"; }
 fi
 (( REQUIRE_SERVER )) && [ -z "$SERVER_DIR" ] && die "no review server is running${USER_QUEUE:+ on $USER_QUEUE}; start one with: review-server start"
 
