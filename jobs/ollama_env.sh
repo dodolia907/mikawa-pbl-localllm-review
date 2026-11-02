@@ -14,7 +14,15 @@ if [ ! -x "$OLLAMA" ]; then
   echo "Ollama が見つかりません: $OLLAMA (README の手順で導入してください)" >&2; exit 1
 fi
 
-hostname; nvidia-smi --query-gpu=name,memory.used,memory.total --format=csv
+hostname
+if command -v nvidia-smi > /dev/null; then      # iEduq: NVIDIA A100
+  nvidia-smi --query-gpu=name,memory.used,memory.total --format=csv
+elif command -v rocm-smi > /dev/null; then      # Eduq: AMD MI210(Ollama 同梱の ROCm ライブラリを使う)
+  rocm-smi --showproductname --showmeminfo vram 2>&1 | grep -E 'Card Series|VRAM Total Memory' || true
+  if [ ! -d "$LLM_HOME/ollama/lib/ollama/rocm" ]; then
+    echo "Ollama の AMD(ROCm)版のライブラリがありません。README の手順で導入してください" >&2; exit 1
+  fi
+fi
 
 "$OLLAMA" serve > "${OLLAMA_LOG:-/dev/null}" 2>&1 &
 OLLAMA_PID=$!
