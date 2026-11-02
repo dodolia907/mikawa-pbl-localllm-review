@@ -1,35 +1,33 @@
 # mikawa-pbl-localllm-review
 
-豊橋技科大 HPC の IoT・AI 基盤(`iEduq`、NVIDIA A100 80GB)でローカル LLM を動かし、GitHub の PR をレビューする。
-講義では、モノレポに自分のチームの PR が出るたびに自動でレビューする。
+豊橋技科大 HPC の GPU でローカル LLM を動かし、GitHub の PR をレビューする CLI。
+`iEduq`(NVIDIA A100)と `Eduq`(AMD MI210)のどちらでも動く。
+
+```bash
+./review-pr TechnoTUT/dmxctl 3
+./review-pr https://github.com/TechnoTUT/dmxctl/pull/3
+```
 
 ## 仕組み
 
-GitHub から HPC へは外から接続できず、窓口サーバでは cron も常駐も使えない。そのため、
-**講義の時間帯に iEduq のジョブを 1 本動かし、その中で Ollama を起動したまま GitHub を定期的に確認する**。
-
 ```
-schedule_watch.sh(窓口サーバ) --qsub -a 開始時刻--> jobs/watch.pbs(yind00/01, A100)
-                                                     ├ Ollama 起動・モデル読み込み(GPU に載せたまま)
-                                                     └ watch.py: 60 秒ごとにオープンな PR を確認
-                                                          対象チームの新しい PR / 新しい push を見つけたら
-                                                          レビュー → runs/<repo>/pr<番号>-<sha>.md
-                                                          (post_comment が true なら PR にコメント)
+review-pr(窓口サーバ ydev)
+  ├ gh で PR の情報と差分を取得(GitHub のトークンは計算ノードに渡さない)
+  ├ qsub で jobs/review.pbs を投入 ─→ GPU ノード(iEduq: A100 / Eduq: MI210)
+  │                                    ├ Ollama を起動し、モデルを用意して GPU に読み込む
+  │                                    └ review.py: 差分を渡してレビューを得る
+  ├ ジョブが終わるまで進み具合を表示(Ctrl-C でジョブも取り消す)
+  └ レビューを表示(--post なら確認のうえ PR にコメント)
 ```
 
-- 同じコミットは 2 回レビューしない(`runs/<repo>/state.json` に記録)。push されると新しいコミットとしてレビューする
-- 1 件の失敗で監視は止まらない。同じコミットで 3 回失敗したら諦める
-- iEduq は同時実行 1 ジョブまでだが、待ち行列には複数積めるので、毎週分を前もって予約できる
+結果は `runs/<owner>_<repo>/pr<番号>-<日時>/` に残る。
 
-| ファイル | 役割 |
+| ファイル | 中身 |
 |---|---|
-| `schedule_watch.sh` | 窓口サーバで実行。監視ジョブを予約投入する |
-| `jobs/watch.pbs` | 監視ジョブ |
-| `watch.py` | PR の確認、対象の判定、レビュー、コメント投稿 |
-| `review.py` | Ollama にプロンプトを渡してレビューを得る(標準ライブラリのみ) |
-| `jobs/ollama_env.sh` | Ollama の起動とモデル取得(各ジョブから読み込む) |
-| `submit_review.sh` / `jobs/review.pbs` | 1 件だけ単発でレビューする(試験用) |
-| `jobs/probe.pbs` | GPU とネットワークの疎通確認用 |
+| `review.md` | レビュー |
+| `pr.json` / `pr.diff` | PR の情報と差分 |
+| `progress` | ジョブの進み具合 |
+| `job.log` / `ollama.log` | ジョブと Ollama のログ |
 
 ## 初回セットアップ(窓口サーバで 1 回だけ)
 
@@ -42,52 +40,75 @@ mkdir -p /work/$USER/llm/ollama && cd /work/$USER/llm
 curl -fL -o ollama-linux-amd64.tar.zst \
   https://github.com/ollama/ollama/releases/download/v0.40.13/ollama-linux-amd64.tar.zst
 tar --use-compress-program=zstd -xf ollama-linux-amd64.tar.zst -C ollama
+
+# Eduq(AMD MI210)でも使う場合は、AMD(ROCm)版のライブラリを同じ場所に追加で展開する(約 1GB)
+curl -fL -o ollama-linux-amd64-rocm.tar.zst \
+  https://github.com/ollama/ollama/releases/download/v0.40.13/ollama-linux-amd64-rocm.tar.zst
+tar --use-compress-program=zstd -xf ollama-linux-amd64-rocm.tar.zst -C ollama
 ```
 
-モデル(既定 `flint:40b`、約 23GB。PR #3 での 5 モデル比較で最も正確だった)は初回ジョブの中で `/work/$USER/llm/models` に取得され、以降は使い回される。
-初回だけ取得に数分かかるので、講義前に一度試しておく。
-
-## 設定(config.json)
-
-`config.example.json` をコピーして編集する。
-
-| キー | 意味 |
-|---|---|
-| `repo` | 監視するリポジトリ(`owner/repo`) |
-| `model` | Ollama のモデル名 |
-| `team.paths` | チームのディレクトリ(例 `["teams/team3/"]`)。**末尾に `/` を付ける**(`teams/team3` だと `teams/team30` も一致する) |
-| `team.authors` | チームメンバーの GitHub アカウント |
-| `team.labels` | チームのラベル |
-| `base_branches` | マージ先ブランチを限定する場合に指定 |
-| `diff_team_paths_only` | true なら、チームのディレクトリ以外の差分は LLM に渡さない |
-| `skip_draft` | true なら下書き PR は対象外 |
-| `post_comment` | true なら PR にコメントを投稿する。false ならファイルに保存するだけ |
-| `poll_interval_sec` | GitHub を確認する間隔(秒) |
-
-`team` の各条件は、空なら制限しない。複数指定したらすべてを満たす PR だけが対象になる。
+モデル(既定 `flint:40b`、約 23GB)は初回のジョブの中で `/work/$USER/llm/models` に取得され、以降は使い回される。
 
 ## 使い方
 
-```bash
-# 講義時間に合わせて予約(例: 11/10 13:00 から 100 分)。毎週分を並べて予約してよい
-./schedule_watch.sh config.json "2026-11-10 13:00" 100
-./schedule_watch.sh config.json "2026-11-17 13:00" 100
+```
+review-pr [オプション] <owner/repo> <PR番号>
+review-pr [オプション] <PR の URL>
 
-# 今すぐ 90 分
-./schedule_watch.sh config.json
-
-qstat -u $USER                       # 状態確認(予約中は W と表示される)
-tail -f jobs/logs/live-<ジョブ番号>.log   # 監視中のログ(watch-*.log はジョブ終了後に書き出される)
-ls runs/<owner>_<repo>/              # レビュー結果
-qdel <ジョブID>                       # 予約の取り消し
+  -q, --queue QUEUE    使うキュー: iEduq(NVIDIA A100、既定)か Eduq(AMD MI210)
+  -g, --gpus N         使う GPU 数(iEduq は 1、Eduq は 1〜2。既定 1)
+  -H, --host NODE      ノードを固定する(例 yind01)
+  -m, --model MODEL    Ollama のモデル(既定 flint:40b)
+  -o, --output FILE    レビューを FILE にも保存する
+      --post           レビューを PR にコメントとして投稿する(投稿前に確認する)
+      --no-wait        ジョブを投入したら待たずに終わる
 ```
 
-1 件だけ試す: `./submit_review.sh TechnoTUT/dmxctl 3`
+進み具合は標準エラーに、レビュー本文は標準出力に出るので、`> review.md` で本文だけ保存できる。
+
+### キュー
+
+| キュー | ノード | GPU | 1 ジョブの上限 |
+|---|---|---|---|
+| `iEduq` | yind00, yind01 | NVIDIA A100 80GB × 1 | CPU 8、メモリ 64GB、8 時間 |
+| `Eduq` | ysnd00(ysnd01 は 2026-11-03 時点で停止中) | AMD Instinct MI210 64GB × 2 | CPU 8、メモリ 64GB、GPU 2、8 時間 |
+
+- どちらも同時実行は 1 人 1 ジョブ。2 つのキューは別々なので、iEduq と Eduq で 1 本ずつ同時に動かせる
+- ジョブが保留(H)になると、`review-pr` はジョブを取り消して終わる。ノードの不調の可能性があるので、`-H` で別のノードを指定する
+  (2026-11-03 に yind00 で GPU の初期化に失敗し、その後ジョブが起動しなくなった)
+
+## モデルの選び方
+
+PR #3(CI の変更、差分 99 行)で、指摘を差分と照らし合わせて比べた結果(2026-11-03、iEduq):
+
+| モデル | 正しい指摘 | 誤った指摘 | 時間 |
+|---|---|---|---|
+| qwen3-coder:30b | 0 | 2 | 19 秒 |
+| qwen3.8:27b-q8_0 | 3 | 0 | 243 秒 |
+| muse-glimmer:30b-q8_0 | 4 | 2 | 181 秒 |
+| **flint:40b**(既定) | **5** | **0** | 274 秒 |
+| ornith-1.5:35b | 5 | 1 | 412 秒 |
+
+PR 1 件だけでの比較なので、別の PR でも比べるとよい。同じ PR を複数のモデルで比べるには:
+
+```bash
+./submit_compare.sh runs/TechnoTUT_dmxctl/pr3-<日時> flint:40b qwen3.8:27b-q8_0
+```
 
 ## 制約と注意
 
-- iEduq は同時実行 1 ジョブ、GPU 1 枚、最長 8 時間。監視時間 + 20 分(書き終えるための余裕)が 8 時間を超える予約はできない
-- 混雑していると、指定した開始時刻を過ぎてから始まることがある
 - 差分は約 16 万文字で打ち切る(コンテキスト長 131072 トークン)。打ち切られた後ろのファイルはレビューされない
-- 計算ノードでは `~/.config/gh` の認証情報を使う。講義で使う場合は、対象リポジトリだけに権限を絞った
-  fine-grained token(Contents: Read、Pull requests: Read and write)を使うほうが安全
+- レビューは誤りを含むことがある。`--post` で投稿するときは、内容を確かめてから投稿する
+- gh の認証情報は窓口サーバでだけ使う(計算ノードには PR の情報と差分だけを渡す)
+
+## ファイル
+
+| ファイル | 役割 |
+|---|---|
+| `review-pr` | CLI。PR の取得、ジョブの投入と待機、結果の表示と投稿 |
+| `review.py` | Ollama にプロンプトを渡してレビューを得る(標準ライブラリのみ) |
+| `jobs/review.pbs` | レビューのジョブ |
+| `jobs/ollama_env.sh` | Ollama の起動、モデルの取得、GPU への読み込みの確認 |
+| `jobs/qsub_common.sh` | キューに応じた qsub の引数(コンテナ・GPU 数・ノード) |
+| `submit_compare.sh` / `jobs/compare.pbs` | 同じ PR を複数のモデルでレビューして比べる |
+| `jobs/probe.pbs` / `jobs/probe-amd.pbs` | GPU とネットワークの疎通確認(iEduq / Eduq) |
