@@ -188,6 +188,7 @@ PR 1 件だけでの比較なので、別の PR でも比べるとよい。同�
 | `review-pr` | CLI。PR の取得、ジョブの投入(またはサーバへの依頼)と待機、結果の表示と投稿 |
 | `review-server` / `jobs/server.pbs` | レビューサーバの起動・状態確認・停止 / 常駐ジョブ |
 | `jobs/server_common.sh` | サーバの一覧と生死の判定 |
+| `jobs/ui.sh` | 色の設定と、対話用の入力・メニュー(`review-pr` と `review-server` で共通) |
 | `review.py` | Ollama にプロンプトを渡してレビューを得る(標準ライブラリのみ) |
 | `jobs/review.pbs` | レビューのジョブ |
 | `jobs/ollama_env.sh` | Ollama の起動、モデルの取得、GPU への読み込みの確認 |

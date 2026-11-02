@@ -23,8 +23,7 @@ EOF
 
 die() { echo "review-server: $*" >&2; exit 1; }
 ROOT=$(cd "$(dirname "$(realpath "$0")")" && pwd)
-if [ -t 2 ]; then DIM=$'\e[2m' BOLD=$'\e[1m' GREEN=$'\e[32m' RED=$'\e[31m' RESET=$'\e[0m'
-else DIM= BOLD= GREEN= RED= RESET=; fi
+. "$ROOT/jobs/ui.sh"                  # 色の設定
 
 . "$ROOT/jobs/server_common.sh"
 alive() { server_alive "$@"; }
