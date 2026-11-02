@@ -1,0 +1,18 @@
+#!/bin/bash
+#PBS -q iEduq
+#PBS -N llmwatch
+#PBS -l select=1:ncpus=8:mem=64gb:ngpus=1
+#PBS -j oe
+#PBS -v SINGULARITY_IMAGE=/common/Singularity_sif/prg_env_intel_2025.02.sif
+# 監視ジョブ。schedule_watch.sh から CONFIG, WATCH_MINUTES, ROOT を受け取る(walltime も向こうで指定)。
+set -euo pipefail
+ulimit -c 0
+
+UNTIL=$(( $(date +%s) + WATCH_MINUTES * 60 ))   # モデル取得の時間も監視時間に含める
+MODEL=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["model"])' "$CONFIG")
+OLLAMA_LOG=$ROOT/jobs/logs/ollama-${PBS_JOBID%%.*}.log
+. "$ROOT/jobs/ollama_env.sh"
+
+# PBS の -o はジョブ終了時にしか書き出されないので、監視中に見られるログを別に書く
+python3 -u "$ROOT/watch.py" --config "$CONFIG" --host "$OLLAMA_URL" --until "$UNTIL" \
+  2>&1 | tee "$ROOT/jobs/logs/live-${PBS_JOBID%%.*}.log"
