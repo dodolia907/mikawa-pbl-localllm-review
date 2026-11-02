@@ -1,0 +1,142 @@
+#!/bin/bash
+# モデルを GPU に載せたまま常駐するジョブ(レビューサーバ)を操作する。窓口サーバ(ydev)で実行する。
+# review-pr は、動いているサーバがあれば、ジョブを投入せずにサーバへ依頼する。
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: review-server start [options]     Start a server job that keeps the model loaded
+       review-server status              List servers and their queues
+       review-server stop [ID] [--now]   Stop a server (default: the only running one)
+
+Options for start:
+  -q, --queue QUEUE    iEduq (NVIDIA A100, default) or Eduq (AMD MI210)
+  -g, --gpus N         Number of GPUs (iEduq: 1, Eduq: 1-2; default 1)
+  -H, --host NODE      Pin the server to a node (e.g. yind01)
+  -m, --model MODEL    Model to keep loaded (default flint:40b)
+  -t, --time HOURS     How long the server runs (default 8, the queue limit)
+      --no-wait        Do not wait until the model is loaded
+
+stop finishes the review in progress and then exits; --now cancels the job immediately.
+EOF
+}
+
+die() { echo "review-server: $*" >&2; exit 1; }
+ROOT=$(cd "$(dirname "$(realpath "$0")")" && pwd)
+if [ -t 2 ]; then DIM=$'\e[2m' BOLD=$'\e[1m' GREEN=$'\e[32m' RED=$'\e[31m' RESET=$'\e[0m'
+else DIM= BOLD= GREEN= RED= RESET=; fi
+
+. "$ROOT/jobs/server_common.sh"
+alive() { server_alive "$@"; }
+
+fmt_left() { local s=$1; (( s < 0 )) && s=0; printf '%dh %02dm' $((s / 3600)) $((s % 3600 / 60)); }
+
+cmd_status() {
+  local d any=0 st host model end job q running
+  for d in $(list_servers); do
+    alive "$d" || continue
+    any=1
+    read -r st < "$d/status"; job=$(cat "$d/job"); q=$(cat "$d/queue_name")
+    host=- model=$(cat "$d/model") end=0
+    [ -f "$d/info" ] && read -r host model end < "$d/info"
+    printf '%s%s%s  %s  job %s  %s on %s  ' "$BOLD" "$(basename "$d")" "$RESET" \
+      "$([ "$st" = ready ] && echo "${GREEN}ready${RESET}" || echo "$st")" "${job%%.*}" "$q" "$host"
+    printf '%s  ' "$model"
+    (( end > 0 )) && printf '%s left  ' "$(fmt_left $(( end - $(date +%s) )))"
+    running=$(ls -1 "$d/running" 2>/dev/null | wc -l)
+    printf '%s\n' "$(( running )) running, $(ls -1 "$d/queue" 2>/dev/null | wc -l) waiting"
+  done
+  (( any )) || echo "No server is running. Start one with: review-server start"
+}
+
+cmd_start() {
+  local QUEUE=${QUEUE:-} NGPUS=${NGPUS:-} HOST=${HOST:-} MODEL=flint:40b HOURS=8 WAIT=1
+  while (( $# )); do
+    case $1 in
+      -q|--queue) QUEUE=${2:?}; shift 2 ;;
+      -g|--gpus)  NGPUS=${2:?}; shift 2 ;;
+      -H|--host)  HOST=${2:?}; shift 2 ;;
+      -m|--model) MODEL=${2:?}; shift 2 ;;
+      -t|--time)  HOURS=${2:?}; shift 2 ;;
+      --no-wait)  WAIT=0; shift ;;
+      *) usage >&2; die "unknown option: $1" ;;
+    esac
+  done
+  [[ $HOURS =~ ^[0-9]+([.][0-9]+)?$ ]] || die "--time takes hours (e.g. 8 or 2.5)"
+  local wall_sec; wall_sec=$(awk -v h="$HOURS" 'BEGIN { s = int(h * 3600); if (s > 28800) s = 28800; print s }')
+  (( wall_sec >= 1800 )) || die "--time must be at least 0.5 hours"
+  . "$ROOT/jobs/qsub_common.sh"
+  # 同じキューで動いているサーバがあれば、二重に立てない(同時実行は 1 人 1 ジョブ)
+  local d
+  for d in $(list_servers); do
+    if alive "$d" && [ "$(cat "$d/queue_name")" = "$QUEUE" ]; then
+      die "a server is already running on $QUEUE ($(basename "$d")); see: review-server status"
+    fi
+  done
+
+  local id dir wall job
+  id=$(date +%Y%m%d-%H%M%S)-$QUEUE
+  dir=$SERVERS/$id
+  mkdir -p "$dir"
+  printf -v wall '%02d:%02d:00' $(( wall_sec / 3600 )) $(( wall_sec % 3600 / 60 ))
+  echo "$QUEUE" > "$dir/queue_name"; echo "$MODEL" > "$dir/model"
+  echo starting > "$dir/status"
+  job=$(qsub -o "$dir/job.log" "${QSUB_ARGS[@]}" -l "walltime=$wall" \
+    -v "$QSUB_VARS,SERVER_DIR=$dir,MODEL=$MODEL,ROOT=$ROOT,WALL_SEC=$wall_sec" "$ROOT/jobs/server.pbs")
+  echo "$job" > "$dir/job"
+  echo "Server $BOLD$id$RESET: job ${job%%.*} on $QUEUE (${NGPUS} GPU), model $MODEL, up to $wall" >&2
+  (( WAIT )) || { echo "Check with: review-server status" >&2; exit 0; }
+
+  # モデルが読み込まれるまで待つ(Ctrl-C で待つのをやめても、サーバは動き続ける)
+  trap 'echo; echo "Stopped waiting; the server keeps starting. Check with: review-server status" >&2; exit 0' INT
+  local st= last= line t0; t0=$(date +%s)
+  while :; do
+    read -r st < "$dir/status" 2>/dev/null || true
+    if [ "$st" = ready ]; then break; fi
+    if [ "$st" = stopped ] || ! qstat "$job" > /dev/null 2>&1; then
+      echo "${RED}The server job ended before it was ready.${RESET} Last lines of its log:" >&2
+      tail -10 "$dir/log" "$dir/job.log" 2>/dev/null >&2 || true
+      exit 1
+    fi
+    if qstat -f "$job" 2>/dev/null | grep -q 'job_state = H'; then
+      qdel "$job" 2>/dev/null || true
+      die "the job was held (H); the node may be unhealthy. Try another node with -H"
+    fi
+    line=$( { qstat -f "$job" 2>/dev/null | grep -q 'job_state = Q' && echo "queued"; } || tail -1 "$dir/log" 2>/dev/null || true)
+    if [ -n "$line" ] && [ "$line" != "$last" ]; then
+      printf '%s[%3ds]%s %s\n' "$DIM" $(( $(date +%s) - t0 )) "$RESET" "$line" >&2; last=$line
+    fi
+    sleep 3
+  done
+  echo "${GREEN}Ready.${RESET} review-pr will now send reviews to this server." >&2
+}
+
+cmd_stop() {
+  local id= now=0 d target=()
+  while (( $# )); do
+    case $1 in --now) now=1; shift ;; -*) die "unknown option: $1" ;; *) id=$1; shift ;; esac
+  done
+  for d in $(list_servers); do
+    alive "$d" || continue
+    if [ -z "$id" ] || [ "$(basename "$d")" = "$id" ]; then target+=("$d"); fi
+  done
+  (( ${#target[@]} )) || die "no running server${id:+ named $id}"
+  (( ${#target[@]} == 1 )) || die "several servers are running; give an ID (see: review-server status)"
+  d=${target[0]}
+  if (( now )); then
+    qdel "$(cat "$d/job")" 2>/dev/null || true
+    echo stopped > "$d/status"
+    echo "Cancelled job $(cat "$d/job" | cut -d. -f1)" >&2
+  else
+    touch "$d/stop"
+    echo "Stopping $(basename "$d") after the review in progress (use --now to cancel immediately)" >&2
+  fi
+}
+
+case ${1:-} in
+  start)  shift; cmd_start "$@" ;;
+  status) shift; cmd_status ;;
+  stop)   shift; cmd_stop "$@" ;;
+  -h|--help|help) usage ;;
+  *) usage >&2; exit 1 ;;
+esac

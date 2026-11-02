@@ -1,3 +1,4 @@
 runs/
 jobs/logs/
 __pycache__/
+server/

@@ -1,0 +1,93 @@
+#!/bin/bash
+#PBS -q iEduq
+#PBS -N llmserver
+#PBS -l select=1:ncpus=8:mem=64gb:ngpus=1
+#PBS -l walltime=08:00:00
+#PBS -j oe
+#PBS -v SINGULARITY_IMAGE=/common/Singularity_sif/prg_env_intel_2025.02.sif
+# モデルを GPU に載せたまま常駐し、review-pr からの依頼を順にレビューする。
+# review-server start から SERVER_DIR, MODEL, ROOT, WALL_SEC を受け取る(キュー等も review-server が指定する)。
+#
+# やりとりは共有の /work 上のファイルで行う(ポートは開けない):
+#   $SERVER_DIR/status      starting / ready / stopping / stopped
+#   $SERVER_DIR/info        host model end(終了予定の UNIX 時刻)
+#   $SERVER_DIR/heartbeat   数秒ごとに更新する。止まっていたらサーバは落ちている
+#   $SERVER_DIR/queue/<名前>  依頼。中身は「実行ディレクトリ モデル 見込み時間(分)」
+#   $SERVER_DIR/stop        置かれたら、今の依頼を終えてから止まる
+#   <実行ディレクトリ>/status  queued / running / done / failed / rejected(と理由)
+#   <実行ディレクトリ>/cancel  置かれたら、その依頼のレビューを止める
+set -euo pipefail
+ulimit -c 0
+
+cd "$SERVER_DIR"
+mkdir -p queue running done
+exec > >(tee -a "$SERVER_DIR/log") 2>&1
+START_TS=$(date +%s)
+END_TS=$(( START_TS + WALL_SEC ))
+MARGIN=${MARGIN_SEC:-300}          # 終了の 5 分前には新しい依頼を受けない
+echo starting > status
+touch heartbeat
+
+OLLAMA_LOG=$SERVER_DIR/ollama.log
+. "$ROOT/jobs/ollama_env.sh"        # Ollama を起動し、$MODEL を GPU に読み込む
+LOADED=$MODEL
+
+echo "$(hostname -s) $MODEL $END_TS" > info
+echo ready > status
+echo "Ready: $MODEL on $(hostname -s), until $(date -d @$END_TS +%H:%M)"
+trap 'echo stopped > "$SERVER_DIR/status"; kill $OLLAMA_PID 2>/dev/null || true' EXIT
+
+while :; do
+  touch heartbeat
+  if [ -e stop ]; then echo "Stop requested"; break; fi
+  now=$(date +%s)
+  if (( END_TS - now < MARGIN )); then echo "Time limit is near; stopping"; break; fi
+
+  # いちばん古い依頼を取り出す(mv で取り出すので、同じ依頼を二重に処理しない)
+  req=$(ls -1 queue 2>/dev/null | sort | head -1 || true)
+  if [ -z "$req" ] || ! mv "queue/$req" "running/$req" 2>/dev/null; then
+    sleep 2; continue
+  fi
+  read -r RUN_DIR REQ_MODEL EST_MIN < "running/$req" || true
+  echo "Request $req: $RUN_DIR ($REQ_MODEL, ~${EST_MIN:-?} min)"
+
+  # 残り時間が足りなければ断る(review-pr は単独のジョブに切り替える)
+  if (( now + ${EST_MIN:-15} * 60 > END_TS - 60 )); then
+    echo "rejected not enough time left ($(( (END_TS - now) / 60 )) min)" > "$RUN_DIR/status"
+    mv "running/$req" "done/$req"; continue
+  fi
+
+  echo running > "$RUN_DIR/status"
+  (
+    set -e
+    # 依頼のモデルが載っているものと違えば、取得して読み込む(前のモデルは Ollama が必要に応じて降ろす)
+    if [ "$REQ_MODEL" != "$LOADED" ]; then pull_model "$REQ_MODEL"; load_on_gpu "$REQ_MODEL"; fi
+    python3 "$ROOT/review.py" --host "$OLLAMA_URL" --model "$REQ_MODEL" \
+      --pr-json "$RUN_DIR/pr.json" --diff "$RUN_DIR/pr.diff" --out "$RUN_DIR/review.md" \
+      --stream "$RUN_DIR/stream.txt"
+  ) > "$RUN_DIR/job.log" 2>&1 &
+  pid=$!
+  # レビュー中も heartbeat を更新し、取り消しの依頼を見る
+  while kill -0 $pid 2>/dev/null; do
+    touch heartbeat
+    if [ -e "$RUN_DIR/cancel" ]; then
+      pkill -P $pid 2>/dev/null || true; kill $pid 2>/dev/null || true
+      echo "Request $req cancelled"
+    fi
+    sleep 2
+  done
+  if wait $pid; then result=done; else result=failed; fi
+  [ -e "$RUN_DIR/cancel" ] && result="failed cancelled"
+  [ "$REQ_MODEL" != "$LOADED" ] && [ "$result" = done ] && LOADED=$REQ_MODEL
+  echo "$result" > "$RUN_DIR/status"
+  echo "Request $req: $result"
+  mv "running/$req" "done/$req"
+done
+
+echo stopping > status
+# 受けきれなかった依頼は断る
+for req in $(ls -1 queue 2>/dev/null); do
+  read -r RUN_DIR _ < "queue/$req" || continue
+  echo "rejected the server is stopping" > "$RUN_DIR/status"
+  mv "queue/$req" "done/$req"
+done

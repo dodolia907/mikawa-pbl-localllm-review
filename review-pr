@@ -21,12 +21,17 @@ Options:
       --post           Post the review as a PR comment (asks for confirmation first)
       --no-wait        Submit the job and exit without waiting
       --quiet          Do not stream the model's output; show progress only
+      --new-job        Always submit a new job, even if a review server is running
+      --server         Require a running review server (see review-server)
   -h, --help           Show this help
 
 Examples:
   review-pr TechnoTUT/dmxctl 3
   review-pr https://github.com/TechnoTUT/dmxctl/pull/3
   review-pr -q Eduq -m qwen3.8:27b-q8_0 TechnoTUT/dmxctl 3
+
+If a review server is running (review-server start), reviews are sent to it instead of
+submitting a new job, so the model does not have to be loaded each time.
 EOF
 }
 
@@ -34,7 +39,7 @@ die() { echo "review-pr: $*" >&2; exit 1; }
 
 ROOT=$(cd "$(dirname "$(realpath "$0")")" && pwd)
 MODEL=flint:40b
-OUTPUT= POST=0 WAIT=1 INTERACTIVE=0 QUIET=0
+OUTPUT= POST=0 WAIT=1 INTERACTIVE=0 QUIET=0 NEW_JOB=0 REQUIRE_SERVER=0 SERVER_DIR=
 REPO= PR=
 ARGS=()
 while (( $# )); do
@@ -48,6 +53,8 @@ while (( $# )); do
     --post)      POST=1; shift ;;
     --no-wait)   WAIT=0; shift ;;
     --quiet)     QUIET=1; shift ;;
+    --new-job)   NEW_JOB=1; shift ;;
+    --server)    REQUIRE_SERVER=1; shift ;;
     -h|--help)   usage; exit 0 ;;
     -*)          usage >&2; die "unknown option: $1" ;;
     *)           ARGS+=("$1"); shift ;;
@@ -67,6 +74,9 @@ else
   usage >&2; exit 1
 fi
 command -v gh > /dev/null || die "gh not found"
+(( NEW_JOB && REQUIRE_SERVER )) && die "--new-job and --server cannot be used together"
+. "$ROOT/jobs/server_common.sh"
+USER_QUEUE=${QUEUE:-}                 # -q で明示されたキュー(サーバを選ぶときに合わせる)
 
 # 端末に出すときだけ色や記号を使う
 if [ -t 2 ]; then
@@ -156,11 +166,22 @@ interactive() {
     fi
   fi
 
-  menu sel "Queue / GPU" "${QUEUE:-iEduq}:${NGPUS:-1}" \
-    $'iEduq:1\tiEduq  NVIDIA A100 80GB x1 (yind00/01)' \
-    $'Eduq:1\tEduq   AMD MI210 64GB x1 (ysnd00/01)' \
-    $'Eduq:2\tEduq   AMD MI210 64GB x2 (ysnd00/01; for models over 64GB, no speedup for models that fit on one)'
-  QUEUE=${sel%:*} NGPUS=${sel#*:}
+  local -a srv=() d def="${QUEUE:-iEduq}:${NGPUS:-1}"
+  if (( !NEW_JOB )); then
+    for d in $(list_servers); do
+      server_alive "$d" && srv+=("server:$d"$'\t'"Running server: $(server_desc "$d") (no model loading)")
+    done
+    (( ${#srv[@]} )) && def=${srv[0]%%$'\t'*}
+  fi
+  menu sel "Where to run" "$def" "${srv[@]}" \
+    $'iEduq:1\tNew job: iEduq  NVIDIA A100 80GB x1 (yind00/01)' \
+    $'Eduq:1\tNew job: Eduq   AMD MI210 64GB x1 (ysnd00/01)' \
+    $'Eduq:2\tNew job: Eduq   AMD MI210 64GB x2 (ysnd00/01; for models over 64GB, no speedup for models that fit on one)'
+  if [[ $sel == server:* ]]; then
+    SERVER_DIR=${sel#server:}; QUEUE=$(cat "$SERVER_DIR/queue_name"); NGPUS=
+  else
+    QUEUE=${sel%:*} NGPUS=${sel#*:}; (( ${#srv[@]} )) && NEW_JOB=1
+  fi
 
   # 取得済みのモデル(/work/$USER/llm/models の目録)を選択肢にする
   opts=()
@@ -177,8 +198,10 @@ interactive() {
     until [ -n "$MODEL" ]; do ask MODEL "Model name (e.g. qwen3.8:27b-q8_0)"; done
   fi
 
-  if [ "$QUEUE" = Eduq ]; then opts=(ysnd00 ysnd01); else opts=(yind00 yind01); fi
-  menu HOST "Node" "${HOST:-}" $'\tAny (whichever is free)' "${opts[0]}"$'\t'"${opts[0]}" "${opts[1]}"$'\t'"${opts[1]}"
+  if [ -z "$SERVER_DIR" ]; then
+    if [ "$QUEUE" = Eduq ]; then opts=(ysnd00 ysnd01); else opts=(yind00 yind01); fi
+    menu HOST "Node" "${HOST:-}" $'\tAny (whichever is free)' "${opts[0]}"$'\t'"${opts[0]}" "${opts[1]}"$'\t'"${opts[1]}"
+  fi
 
   menu POST "Post to PR" "$POST" $'0\tDo not post' $'1\tPost as a PR comment (shows the review and asks first)'
   if (( POST )); then
@@ -189,9 +212,15 @@ interactive() {
 
   # 同じ内容を引数で指定するコマンド(次回からそのまま使える)
   local cmd="review-pr"
-  [ "$QUEUE" != iEduq ] && cmd+=" -q $QUEUE"
-  [ "${NGPUS:-1}" != 1 ] && cmd+=" -g $NGPUS"
-  [ -n "${HOST:-}" ] && cmd+=" -H $HOST"
+  if [ -n "$SERVER_DIR" ]; then
+    cmd+=" --server"
+    [ "$QUEUE" != iEduq ] && cmd+=" -q $QUEUE"
+  else
+    (( NEW_JOB )) && cmd+=" --new-job"
+    [ "$QUEUE" != iEduq ] && cmd+=" -q $QUEUE"
+    [ "${NGPUS:-1}" != 1 ] && cmd+=" -g $NGPUS"
+    [ -n "${HOST:-}" ] && cmd+=" -H $HOST"
+  fi
   [ "$MODEL" != flint:40b ] && cmd+=" -m $MODEL"
   [ -n "$OUTPUT" ] && cmd+=" -o $OUTPUT"
   (( POST )) && cmd+=" --post"
@@ -223,12 +252,46 @@ print(len(review.make_parts(open(sys.argv[1], encoding="utf-8", errors="replace"
 (( WALL_MIN > 480 )) && WALL_MIN=480
 printf -v WALL '%02d:%02d:00' $(( WALL_MIN / 60 )) $(( WALL_MIN % 60 ))
 
-JOB=$(qsub -o "$RUN/job.log" "${QSUB_ARGS[@]}" -l "walltime=$WALL" \
-  -v "$QSUB_VARS,RUN_DIR=$RUN,MODEL=$MODEL,ROOT=$ROOT" "$ROOT/jobs/review.pbs")
-echo "${DIM}Job ${JOB%%.*} on $QUEUE (${NGPUS} GPU, up to $WALL), model $MODEL${RESET}" >&2
+# 動いているレビューサーバを探す(-q や -H を指定していれば、それに合うもの)
+if (( !NEW_JOB )) && [ -z "$SERVER_DIR" ]; then
+  for d in $(list_servers); do
+    server_alive "$d" || continue
+    [ -n "$USER_QUEUE" ] && [ "$(cat "$d/queue_name")" != "$USER_QUEUE" ] && continue
+    if [ -n "${HOST:-}" ]; then
+      read -r h _ < "$d/info" 2>/dev/null || h=
+      [ "$h" != "$HOST" ] && continue
+    fi
+    SERVER_DIR=$d; break
+  done
+fi
+(( REQUIRE_SERVER )) && [ -z "$SERVER_DIR" ] && die "no review server is running${USER_QUEUE:+ on $USER_QUEUE}; start one with: review-server start"
+
+submit_job() {
+  JOB=$(qsub -o "$RUN/job.log" "${QSUB_ARGS[@]}" -l "walltime=$WALL" \
+    -v "$QSUB_VARS,RUN_DIR=$RUN,MODEL=$MODEL,ROOT=$ROOT" "$ROOT/jobs/review.pbs")
+  MODE=job STATE=Q
+  echo "${DIM}Job ${JOB%%.*} on $QUEUE (${NGPUS} GPU, up to $WALL), model $MODEL${RESET}" >&2
+}
+
+REQ=
+if [ -n "$SERVER_DIR" ]; then
+  # サーバの queue/ に依頼を置く(書きかけを読まれないよう、別名で書いてから mv する)
+  MODE=server STATE=Q JOB=
+  REQ=$(date +%s%N)-$$
+  echo queued > "$RUN/status"
+  # サーバでの所要時間の見込み(モデルの読み込みがない分、ジョブより短い): パートごとに 10 分 + まとめ 10 分、Eduq は 2 倍
+  EST_MIN=$(( NPARTS * 10 + (NPARTS > 1 ? 10 : 0) ))
+  [ "$QUEUE" = Eduq ] && EST_MIN=$(( EST_MIN * 2 ))
+  echo "$RUN $MODEL $EST_MIN" > "$SERVER_DIR/.$REQ"
+  mv "$SERVER_DIR/.$REQ" "$SERVER_DIR/queue/$REQ"
+  echo "${DIM}Sent to review server $(basename "$SERVER_DIR") ($(server_desc "$SERVER_DIR")), model $MODEL${RESET}" >&2
+else
+  submit_job
+fi
 echo "${DIM}Output: $RUN${RESET}" >&2
 if (( !WAIT )); then
-  echo "Result will be written to $RUN/review.md (check with: qstat $JOB)" >&2
+  if [ "$MODE" = server ]; then echo "Result will be written to $RUN/review.md (status: $RUN/status)" >&2
+  else echo "Result will be written to $RUN/review.md (check with: qstat $JOB)" >&2; fi
   exit 0
 fi
 
@@ -291,6 +354,50 @@ pump_stream() {
   fi
 }
 
+# サーバに依頼したときの状態: 依頼の status ファイルを読む(5 秒ごとに、サーバが生きているかも見る)
+AHEAD= SRV_CHECK_AT=0
+poll_server() {
+  local st reason now f n
+  read -r st reason < "$RUN/status" 2>/dev/null || st=queued
+  case $st in
+    queued)
+      STATE=Q
+      # 自分より前に並んでいる依頼の数(取り出し済みの実行中の分も足す)
+      n=0
+      for f in "$SERVER_DIR"/queue/*; do [ -e "$f" ] || continue; [[ ${f##*/} < $REQ ]] && n=$(( n + 1 )); done
+      n=$(( n + $(ls -1 "$SERVER_DIR/running" 2>/dev/null | wc -l) ))
+      AHEAD=$n ;;
+    running) STATE=R ;;
+    done|failed) STATE= ;;
+    rejected)
+      clear_status
+      echo "${RED}The review server declined the request:${RESET} $reason; submitting a new job instead" >&2
+      rm -f "$RUN/status"
+      submit_job
+      return ;;
+  esac
+  printf -v now '%(%s)T' -1
+  if [ -n "$STATE" ] && (( now - SRV_CHECK_AT >= 5 )); then
+    SRV_CHECK_AT=$now
+    if ! server_alive "$SERVER_DIR"; then
+      finish_status
+      die "the review server stopped responding; run again (it will submit a new job if no server is running)"
+    fi
+  fi
+}
+
+poll_state() { if [ "$MODE" = server ]; then poll_server; else poll_qstat; fi; }
+
+# 中断したとき: ジョブなら取り消し、サーバへの依頼なら並んでいれば消し、実行中なら止めてもらう
+cancel_run() {
+  if [ "$MODE" = server ]; then
+    if rm "$SERVER_DIR/queue/$REQ" 2>/dev/null; then echo "Interrupted; removed the request from the server queue" >&2
+    else touch "$RUN/cancel"; echo "Interrupted; asked the server to stop this review" >&2; fi
+  else
+    echo "Interrupted; cancelling job ${JOB%%.*}" >&2; qdel "$JOB" 2>/dev/null || true
+  fi
+}
+
 # ジョブの状態を確認する。qstat は 0.2 秒ほどかかって描き直しが止まるので、
 # バックグラウンドで実行して結果をファイルで受け取る(5 秒ごと)
 poll_qstat() {
@@ -318,7 +425,7 @@ update_phase() {
   local p n part total now el
   local -a pl
   case $STATE in
-    Q) PHASE="queued" ;;
+    Q) if [ "$MODE" = server ]; then PHASE="waiting for the server${AHEAD:+ ($AHEAD ahead)}"; else PHASE="queued"; fi ;;
     E) PHASE="finishing" ;;
     R) PHASE="starting"
        if [ -s "$RUN/progress" ]; then mapfile -t pl < "$RUN/progress"; PHASE=${pl[-1],,}; fi
@@ -364,11 +471,11 @@ draw_status() {
 finish_status() { clear_status; (( TTY )) && printf '\e[?25h' >&2 || true; }
 
 # 待っている間に Ctrl-C されたら、ジョブも取り消す
-trap 'finish_status; echo; echo "Interrupted; cancelling job ${JOB%%.*}" >&2; qdel "$JOB" 2>/dev/null; exit 130' INT TERM
+trap 'finish_status; echo; cancel_run; exit 130' INT TERM
 (( TTY )) && printf '\e[?25l' >&2            # 状態表示の間はカーソルを隠す
-poll_qstat
+poll_state
 while :; do
-  poll_qstat
+  poll_state
   [ -z "$STATE" ] && break                   # qstat に出なくなったらジョブは終わっている
   if [ "$STATE" = H ]; then
     qdel "$JOB" 2>/dev/null; finish_status
