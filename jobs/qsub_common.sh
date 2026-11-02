@@ -5,10 +5,13 @@
 # ジョブスクリプト内の #PBS -q/-l/-v は、ここで指定した値で上書きされる。
 QUEUE=${QUEUE:-iEduq}
 case $QUEUE in
-  iEduq) SIF=/common/Singularity_sif/prg_env_intel_2025.02.sif; MAX_GPUS=1 ;;
-  Eduq)  SIF=/common/Singularity_sif/prg_env_amd_2025.02.sif;   MAX_GPUS=2 ;;
+  iEduq) SIF=/common/Singularity_sif/prg_env_intel_2025.02.sif; MAX_GPUS=1; NODES="yind00 yind01" ;;
+  Eduq)  SIF=/common/Singularity_sif/prg_env_amd_2025.02.sif;   MAX_GPUS=2; NODES="ysnd00 ysnd01" ;;
   *) echo "未対応のキューです: $QUEUE(iEduq か Eduq)" >&2; exit 1 ;;
 esac
+if [ -n "${HOST:-}" ] && [[ " $NODES " != *" $HOST "* ]]; then
+  echo "$QUEUE のノードは $NODES です(HOST=$HOST)" >&2; exit 1
+fi
 NGPUS=${NGPUS:-1}
 if (( NGPUS < 1 || NGPUS > MAX_GPUS )); then
   echo "$QUEUE で使える GPU は 1〜$MAX_GPUS 枚です(NGPUS=$NGPUS)" >&2; exit 1
