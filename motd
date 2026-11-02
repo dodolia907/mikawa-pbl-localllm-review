@@ -3,3 +3,6 @@
    ██    ██    ██    ██        ███████ ██████  ██          ██      ██████
    ██    ██    ██    ██        ██   ██ ██      ██          ██      ██   ██
    ██     ██████     ██        ██   ██ ██       ██████      ██████ ██   ██
+
+TUT HPC Code Review - GitHub pull request reviews by a local LLM on TUT HPC GPUs
+(iEduq: NVIDIA A100 / Eduq: AMD MI210). No external AI service sees your code.
