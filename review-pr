@@ -305,7 +305,9 @@ poll_qstat() {
   printf -v now '%(%s)T' -1
   if (( now - QSTAT_AT >= 5 )); then
     QSTAT_AT=$now
-    { qstat -f "$JOB" 2>/dev/null | awk '/job_state =/ {print $3}' > "$QSTATE_FILE.tmp"
+    # ジョブが終わると qstat は失敗する。set -e と pipefail を引き継いだサブシェルがそこで止まらないよう、
+    # 失敗しても必ず(空の)結果を書く。空なら、ジョブは終わっている
+    { qstat -f "$JOB" 2>/dev/null | awk '/job_state =/ {print $3}' > "$QSTATE_FILE.tmp" || true
       mv -f "$QSTATE_FILE.tmp" "$QSTATE_FILE"; } &
     QSTAT_PID=$!
   fi
