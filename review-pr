@@ -114,21 +114,30 @@ interactive() {
     fi
   fi
 
-  local -a srv=() d def="${QUEUE:-iEduq}:${NGPUS:-1}"
-  if (( !NEW_JOB )); then
-    for d in $(list_servers); do
-      server_alive "$d" && srv+=("server:$d"$'\t'"Running server: $(server_desc "$d") (no model loading)")
-    done
-    (( ${#srv[@]} )) && def=${srv[0]%%$'\t'*}
-  fi
-  menu sel "Where to run" "$def" "${srv[@]}" \
-    $'iEduq:1\tNew job: iEduq  NVIDIA A100 80GB x1 (yind00/01)' \
-    $'Eduq:1\tNew job: Eduq   AMD MI210 64GB x1 (ysnd00/01)' \
-    $'Eduq:2\tNew job: Eduq   AMD MI210 64GB x2 (ysnd00/01; for models over 64GB, no speedup for models that fit on one)'
+  local -a srv=() start=() d def="${QUEUE:-iEduq}:${NGPUS:-1}" busy=" "
+  local -a places=(
+    $'iEduq:1\tiEduq  NVIDIA A100 80GB x1 (yind00/01)'
+    $'Eduq:1\tEduq   AMD MI210 64GB x1 (ysnd00/01)'
+    $'Eduq:2\tEduq   AMD MI210 64GB x2 (ysnd00/01; for models over 64GB, no speedup for models that fit on one)'
+  )
+  for d in $(list_servers); do
+    server_alive "$d" || continue
+    busy+="$(cat "$d/queue_name") "
+    (( NEW_JOB )) || srv+=("server:$d"$'\t'"Running server: $(server_desc "$d") (no model loading)")
+  done
+  (( ${#srv[@]} )) && def=${srv[0]%%$'\t'*}
+  (( START_SERVER )) && def=start
+  # サーバは 1 キューに 1 つまで(同時実行は 1 人 1 ジョブ)。サーバのないキューがあれば起動の選択肢を出す
+  for d in "${places[@]}"; do [[ $busy == *" ${d%%:*} "* ]] || start+=("$d"); done
+  (( !NEW_JOB && ${#start[@]} )) && srv+=($'start\tStart a review server (up to 8h)')
+  menu sel "Where to run" "$def" "${srv[@]}" "${places[@]/$'\t'/$'\t'New job: }"
   if [[ $sel == server:* ]]; then
     SERVER_DIR=${sel#server:}; QUEUE=$(cat "$SERVER_DIR/queue_name"); NGPUS=
+  elif [ "$sel" = start ]; then
+    menu sel "Server queue / GPU" "${QUEUE:-iEduq}:${NGPUS:-1}" "${start[@]}"
+    QUEUE=${sel%:*} NGPUS=${sel#*:} START_SERVER=1 USER_QUEUE=${sel%:*}
   else
-    QUEUE=${sel%:*} NGPUS=${sel#*:}; (( ${#srv[@]} )) && NEW_JOB=1
+    QUEUE=${sel%:*} NGPUS=${sel#*:} START_SERVER=0; (( ${#srv[@]} )) && NEW_JOB=1
   fi
 
   # 取得済みのモデル(/work/$USER/llm/models の目録)を選択肢にする
@@ -165,7 +174,9 @@ interactive() {
     [ "$QUEUE" != iEduq ] && cmd+=" -q $QUEUE"
   else
     (( NEW_JOB )) && cmd+=" --new-job"
-    [ "$QUEUE" != iEduq ] && cmd+=" -q $QUEUE"
+    # --start-server は -q がないと、ほかのキューで動いているサーバにも依頼するので、キューを必ず書く
+    if (( START_SERVER )); then cmd+=" --start-server -q $QUEUE"
+    elif [ "$QUEUE" != iEduq ]; then cmd+=" -q $QUEUE"; fi
     [ "${NGPUS:-1}" != 1 ] && cmd+=" -g $NGPUS"
     [ -n "${HOST:-}" ] && cmd+=" -H $HOST"
   fi
