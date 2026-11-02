@@ -86,7 +86,9 @@ USER_QUEUE=${QUEUE:-}                 # -q で明示されたキュー(サーバ
 
 # 起動時のバナー(リポジトリ直下の motd)。ログに残さないよう、端末に出すときだけ表示する
 if [ -t 2 ] && [ -f "$ROOT/motd" ]; then
-  { printf '%s' "$CYAN"; cat "$ROOT/motd"; printf '%s\n' "$RESET"; } >&2
+  # 最初の空行まで(アスキーアート)はシアン、その下の説明は通常の色
+  awk -v c="$CYAN" -v r="$RESET" '!art && /^$/ { art = 1 } { print (art ? $0 : c $0 r) } END { print "" }' \
+    "$ROOT/motd" >&2
 fi
 
 # ---- 対話モード ----------------------------------------------------------
