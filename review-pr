@@ -282,7 +282,6 @@ STREAM=$RUN/stream.txt
 TTY=0; [ -t 2 ] && TTY=1
 VERBS=(Simmering Pondering Brewing Percolating Cogitating Mulling Ruminating Noodling
        Deliberating Marinating Contemplating Musing Churning Stewing Puzzling Scheming)
-GLYPHS=('·' '✢' '✳' '✶' '✻' '✽' '✻' '✶' '✳' '✢')
 FRAME=0.1                                     # 状態表示を描き直す間隔(秒)
 VERB=${VERBS[RANDOM % ${#VERBS[@]}]}
 OFF=0 PARTIAL= SECTION= PHASE="queued" LASTPHASE= TOKENS=0 TICK=0
@@ -431,7 +430,7 @@ update_phase() {
   fi
 }
 
-# 一番下の状態表示の行: ✻ Simmering… (1m 12s · 3.4k tokens · thinking)  途中の行…
+# 一番下の状態表示の行: Simmering… (1m 12s · 3.4k tokens · thinking)  途中の行…
 draw_status() {
   (( TTY )) || return 0
   local now el tk info ptail
@@ -442,8 +441,7 @@ draw_status() {
   info+=" · $PHASE"
   ptail=${PARTIAL: -60}
   # 折り返しを止めて 1 回の書き込みで描く(長い行は画面の端で切れる)
-  printf '\e[?7l\r%s %s… %s%s\e[K\e[?7h' "${CYAN}${GLYPHS[TICK % ${#GLYPHS[@]}]}${RESET}" "${BOLD}${VERB}${RESET}" \
-    "${DIM}(${info})" "${ptail:+  $ptail}${RESET}" >&2
+  printf '\e[?7l\r%s… %s%s\e[K\e[?7h' "${BOLD}${VERB}${RESET}" "${DIM}(${info})" "${ptail:+  $ptail}${RESET}" >&2
   TICK=$(( TICK + 1 ))
 }
 
@@ -460,7 +458,7 @@ while :; do
     qdel "$JOB" 2>/dev/null; finish_status
     die "the job was held (H); the node may be unhealthy. Try another node with -H"
   fi
-  # ファイルを読む処理は 3 コマに 1 回(0.3 秒ごと)。記号は毎コマ回す
+  # ファイルを読む処理は 3 コマに 1 回(0.3 秒ごと)。描き直しは毎コマ
   if (( TICK % 3 == 0 )); then update_phase; pump_stream; fi
   draw_status
   (( TTY )) || TICK=$(( TICK + 1 ))
