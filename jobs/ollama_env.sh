@@ -7,7 +7,7 @@ export OLLAMA_HOST=127.0.0.1:$((20000 + RANDOM % 10000))
 # 入力(差分は最大 16 万文字 ≒ 5 万トークン)+ 考える過程(大きな PR で 1.5 万トークン以上)+ 本文が収まる長さ。
 # 65536 では PR #4(入力 5 万トークン)で考える途中に上限に達し、本文が空になった。
 export OLLAMA_CONTEXT_LENGTH=${OLLAMA_CONTEXT_LENGTH:-131072}
-export OLLAMA_KEEP_ALIVE=-1                # 監視中にモデルを GPU から降ろさない
+export OLLAMA_KEEP_ALIVE=-1                # ジョブの間はモデルを GPU から降ろさない(比較ジョブで複数回使う)
 OLLAMA_URL=http://$OLLAMA_HOST
 
 if [ ! -x "$OLLAMA" ]; then
@@ -19,7 +19,7 @@ if command -v nvidia-smi > /dev/null; then      # iEduq: NVIDIA A100
   nvidia-smi --query-gpu=name,memory.used,memory.total --format=csv
 elif command -v rocm-smi > /dev/null; then      # Eduq: AMD MI210(Ollama 同梱の ROCm ライブラリを使う)
   rocm-smi --showproductname --showmeminfo vram 2>&1 | grep -E 'Card Series|VRAM Total Memory' || true
-  if [ ! -d "$LLM_HOME/ollama/lib/ollama/rocm" ]; then
+  if ! compgen -G "$LLM_HOME/ollama/lib/ollama/rocm*" > /dev/null; then   # v0.40.13 では rocm_v7_2
     echo "Ollama の AMD(ROCm)版のライブラリがありません。README の手順で導入してください" >&2; exit 1
   fi
 fi
@@ -27,6 +27,7 @@ fi
 "$OLLAMA" serve > "${OLLAMA_LOG:-/dev/null}" 2>&1 &
 OLLAMA_PID=$!
 trap 'kill $OLLAMA_PID 2>/dev/null || true' EXIT
+echo "Ollama を起動中"
 for _ in $(seq 60); do curl -sf "$OLLAMA_URL/api/version" >/dev/null && break; sleep 2; done
 
 # モデルのファイル(blob)を curl で先に取得する。
@@ -67,6 +68,7 @@ for l in m["layers"] + [m["config"]]: print(l["digest"], l["size"])' <<< "$manif
 # curl での事前取得に失敗した場合に備え、ollama pull も止まったら中断してやり直す。
 pull_model() {
   local m=$1 try size last stalled
+  echo "モデル $m を用意中(初回は取得に 10 分ほどかかる)"
   fetch_blobs "$m" || echo "fetch $m: 事前取得に失敗したので ollama pull に任せる"
   for try in 1 2 3 4 5; do
     "$OLLAMA" pull "$m" > /dev/null 2>&1 &
@@ -88,12 +90,13 @@ pull_model() {
 # その場合は続けずにエラーで終わる(同じ手順でも GPU に載る回と載らない回があった)。
 load_on_gpu() {
   local m=$1 vram
+  echo "モデル $m を GPU に読み込み中"
   curl -sf -m 600 "$OLLAMA_URL/api/generate" -d "{\"model\":\"$m\",\"keep_alive\":-1}" > /dev/null
   vram=$(curl -sf "$OLLAMA_URL/api/ps" | python3 -c 'import json,sys,os
 print(sum(x.get("size_vram",0) for x in json.load(sys.stdin)["models"] if x["name"]==sys.argv[1] or x["model"]==sys.argv[1]))' "$m")
   if [ "${vram:-0}" -le 0 ]; then
-    echo "load $m: GPU に載りませんでした(CPU で動いている)。ollama のログで CUDA のエラーを確認してください" >&2
-    grep -m3 -iE 'cuda.*(fail|error)' "${OLLAMA_LOG:-/dev/null}" >&2 || true
+    echo "load $m: GPU に載りませんでした(CPU で動いている)。ollama のログで GPU のエラーを確認してください" >&2
+    grep -m3 -iE '(cuda|rocm|hip).*(fail|error)' "${OLLAMA_LOG:-/dev/null}" >&2 || true
     return 1
   fi
   echo "load $m: GPU に $((vram / 1024 / 1024)) MiB 載りました"
