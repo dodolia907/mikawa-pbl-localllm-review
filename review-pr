@@ -84,6 +84,11 @@ USER_QUEUE=${QUEUE:-}                 # -q で明示されたキュー(サーバ
 
 . "$ROOT/jobs/ui.sh"                  # 色の設定と、対話用の入力(ask)・メニュー(menu)
 
+# 起動時のバナー(リポジトリ直下の motd)。ログに残さないよう、端末に出すときだけ表示する
+if [ -t 2 ] && [ -f "$ROOT/motd" ]; then
+  { printf '%s' "$CYAN"; cat "$ROOT/motd"; printf '%s\n' "$RESET"; } >&2
+fi
+
 # ---- 対話モード ----------------------------------------------------------
 interactive() {
   local -a opts=()
