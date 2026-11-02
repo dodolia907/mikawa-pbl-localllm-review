@@ -5,6 +5,7 @@
 """
 import argparse
 import json
+import os
 import re
 import time
 import urllib.request
@@ -62,24 +63,111 @@ def build_prompt(pr, files, diff, note=""):
     return prompt, truncated
 
 
-def chat(host, model, user, timeout=3600):
+class StreamWriter:
+    """生成途中の出力をファイルに書き足す。review-pr がこれを読んで画面に流す。
+
+    - <path>: 考える過程(=== Thinking ===)と本文(=== Review ===)を、見出しで区切って書き足す
+    - <path>.stat: 「段階 トークン数」の 1 行(reading / thinking / writing / done)
+    path が None なら何もしない。画面に出す見出しは英語にしている。
+    """
+
+    def __init__(self, path=None):
+        self.path = path
+        self.f = open(path, "w", encoding="utf-8") if path else None
+        self.section = None
+        self.chunks = 0
+        self.t0 = time.time()
+        self.last_flush = self.t0
+        self.stat("reading")
+
+    def stat(self, phase):
+        if not self.path:
+            return
+        tmp = self.path + ".stat.tmp"
+        with open(tmp, "w") as f:
+            f.write(f"{phase} {self.chunks}\n")
+        os.replace(tmp, self.path + ".stat")   # 読む側が書きかけを見ないよう、置き換えで更新する
+
+    def note(self, text):
+        if self.f:
+            self.f.write(text)
+            self.f.flush()
+
+    def write(self, kind, text):
+        if not self.f or not text:
+            return
+        if kind != self.section:
+            self.f.write(f"\n=== {'Thinking' if kind == 'thinking' else 'Review'} ===\n")
+            self.section = kind
+        self.f.write(text)
+        self.chunks += 1                       # ストリームの 1 チャンクがおよそ 1 トークン
+        now = time.time()
+        if now - self.last_flush >= 0.3:       # 細かすぎる書き込みを避け、0.3 秒ごとに反映する
+            self.f.flush()
+            self.stat("thinking" if kind == "thinking" else "writing")
+            self.last_flush = now
+
+    def close(self, res, wait_s):
+        if not self.f:
+            return
+        n, ns = res.get("eval_count") or self.chunks, res.get("eval_duration") or 0
+        rate = f", {n / (ns / 1e9):.0f} tok/s" if ns else ""
+        self.f.write(f"\n\n=== Done: {res.get('prompt_eval_count')} input tokens "
+                     f"(read in {wait_s:.0f}s), {n} output tokens{rate}, "
+                     f"{time.time() - self.t0:.0f}s total ===\n")
+        self.f.close()
+        self.chunks = n
+        self.stat("done")
+
+
+def chat(host, model, user, stream=None, timeout=3600):
+    """Ollama の /api/chat をストリーミングで呼ぶ。
+
+    届いた分を stream に書き足し、最後の応答(トークン数などを含む)に本文と考える過程をまとめて返す。
+    """
     body = json.dumps({
         "model": model,
         "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user}],
-        "stream": False,
+        "stream": True,
         "options": {"temperature": 0.2},
     }).encode()
     req = urllib.request.Request(f"{host}/api/chat", data=body,
                                  headers={"Content-Type": "application/json"})
+    stream = stream or StreamWriter()
+    stream.note("=== Reading the diff (takes a few minutes for large diffs) ===\n")
+    content, thinking, first, res = [], [], None, None
+    t0 = time.time()
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.load(r)
+        for line in r:                        # 1 行に 1 つの JSON が届く
+            if not line.strip():
+                continue
+            chunk = json.loads(line)
+            if "error" in chunk:
+                raise RuntimeError(f"Ollama error: {chunk['error']}")
+            msg = chunk.get("message", {})
+            if first is None and (msg.get("thinking") or msg.get("content")):
+                first = time.time() - t0      # 入力を読み終えて生成が始まるまでの時間
+            if msg.get("thinking"):
+                thinking.append(msg["thinking"])
+                stream.write("thinking", msg["thinking"])
+            if msg.get("content"):
+                content.append(msg["content"])
+                stream.write("content", msg["content"])
+            if chunk.get("done"):
+                res = chunk
+                break
+    if res is None:
+        raise RuntimeError("the Ollama response ended unexpectedly")
+    res["message"] = {"content": "".join(content), "thinking": "".join(thinking)}
+    stream.close(res, first or 0)
+    return res
 
 
-def review_pr(host, model, pr, files, diff, note=""):
+def review_pr(host, model, pr, files, diff, note="", stream=None):
     """レビュー本文と、実行情報(HTMLコメント)を返す。"""
     prompt, truncated = build_prompt(pr, files, diff, note)
     t0 = time.time()
-    res = chat(host, model, prompt)
+    res = chat(host, model, prompt, stream)
     meta = (f"<!-- model: {model}, {time.time() - t0:.0f}s, "
             f"prompt_tokens: {res.get('prompt_eval_count')}, "
             f"output_tokens: {res.get('eval_count')}"
@@ -88,9 +176,9 @@ def review_pr(host, model, pr, files, diff, note=""):
     if not text:
         # 考える過程(thinking)だけでコンテキストを使い切ると、本文が空のまま終わる
         raise RuntimeError(
-            f"レビュー本文が空です(done_reason={res.get('done_reason')}, "
-            f"prompt_tokens={res.get('prompt_eval_count')}, output_tokens={res.get('eval_count')})。"
-            "コンテキスト長(OLLAMA_CONTEXT_LENGTH)が足りない可能性があります")
+            f"the review is empty (done_reason={res.get('done_reason')}, "
+            f"prompt_tokens={res.get('prompt_eval_count')}, output_tokens={res.get('eval_count')}); "
+            "the model may have used up the context (OLLAMA_CONTEXT_LENGTH) while thinking")
     return text, meta
 
 
@@ -101,6 +189,7 @@ def main():
     ap.add_argument("--pr-json", required=True)
     ap.add_argument("--diff", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--stream", help="file to append the output to while it is generated")
     args = ap.parse_args()
 
     with open(args.pr_json, encoding="utf-8") as f:
@@ -108,7 +197,8 @@ def main():
     with open(args.diff, encoding="utf-8", errors="replace") as f:
         diff = f.read()
 
-    text, meta = review_pr(args.host, args.model, pr, pr.get("files", []), diff)
+    stream = StreamWriter(args.stream) if args.stream else None
+    text, meta = review_pr(args.host, args.model, pr, pr.get("files", []), diff, stream=stream)
     with open(args.out, "w", encoding="utf-8") as f:
         f.write(meta + "\n\n" + text + "\n")
     print(f"wrote {args.out}")
