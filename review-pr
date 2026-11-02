@@ -103,12 +103,18 @@ interactive() {
   fi
   until [[ $PR =~ ^[0-9]+$ ]]; do ask PR "PR 番号" "${first:-}"; PR=${PR#\#}; done
 
-  choose QUEUE "キュー" "${QUEUE:-iEduq}" \
-    "iEduq NVIDIA A100 80GB × 1(yind00/01)" "Eduq  AMD MI210 64GB × 2(ysnd00)"
-  if [ "$QUEUE" = Eduq ]; then
-    echo "  (1 枚に載るモデルは 2 枚にしても速くならない。2 枚は 64GB を超える大きなモデル向け)" >&2
-    ask NGPUS "GPU 数(1〜2)" "${NGPUS:-1}"
-  fi
+  # キューと GPU 枚数をまとめて選ぶ。選択肢の値は「キュー:枚数」
+  local qg=
+  echo "キューと GPU:" >&2
+  until [[ $qg =~ ^(iEduq:1|Eduq:[12])$ ]]; do
+    [ -n "$qg" ] && echo "  番号か iEduq:1 / Eduq:1 / Eduq:2 で選んでください" >&2
+    choose qg "キューと GPU" "${QUEUE:-iEduq}:${NGPUS:-1}" \
+      "iEduq:1  NVIDIA A100 80GB × 1(yind00/01)" \
+      "Eduq:1   AMD MI210 64GB × 1(ysnd00/01)" \
+      "Eduq:2   AMD MI210 64GB × 2(ysnd00/01。64GB を超える大きなモデル向け。1 枚に載るモデルは速くならない)"
+    [[ $qg == *:* ]] || qg+=":1"      # キュー名だけなら 1 枚
+  done
+  QUEUE=${qg%:*} NGPUS=${qg#*:}
 
   # 取得済みのモデル(/work/$USER/llm/models の目録)を選択肢にする
   while IFS= read -r m; do

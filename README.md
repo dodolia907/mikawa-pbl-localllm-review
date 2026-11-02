@@ -70,7 +70,7 @@ review-pr                       (引数なし: 対話モードで順に選ぶ)
 
 ### 対話モード
 
-引数なしで実行すると、リポジトリ、PR(オープンな PR の一覧から選ぶか番号を入力)、キュー、GPU 数(Eduq のとき)、
+引数なしで実行すると、リポジトリ、PR(オープンな PR の一覧から選ぶか番号を入力)、キューと GPU 枚数(iEduq × 1、Eduq × 1、Eduq × 2)、
 モデル(取得済みの一覧から選ぶか名前を入力)、ノード、投稿するか、終わるまで待つかを順に聞く。
 最後に同じ内容を引数で指定するコマンドを表示し、確認してから実行する。
 
@@ -80,9 +80,11 @@ $ ./review-pr
 オープンな PR:
   #4     リファクタリング: engine.rs / ui_map.rs の分割と clippy 対応  (dodolia907, +2661/-2428)
 PR 番号 [4]: 3
-  1) iEduq NVIDIA A100 80GB × 1(yind00/01)
-  2) Eduq  AMD MI210 64GB × 2(ysnd00)
-キュー [iEduq]: 2
+キューと GPU:
+  1) iEduq:1  NVIDIA A100 80GB × 1(yind00/01)
+  2) Eduq:1   AMD MI210 64GB × 1(ysnd00/01)
+  3) Eduq:2   AMD MI210 64GB × 2(ysnd00/01。64GB を超える大きなモデル向け。…)
+キューと GPU [iEduq:1]: 2
 ...
 実行するコマンド: review-pr -q Eduq TechnoTUT/dmxctl 3
 実行しますか?(y/n) [y]:
@@ -93,7 +95,7 @@ PR 番号 [4]: 3
 | キュー | ノード | GPU | 1 ジョブの上限 |
 |---|---|---|---|
 | `iEduq` | yind00, yind01 | NVIDIA A100 80GB × 1 | CPU 8、メモリ 64GB、8 時間。flint で約 56 トークン/秒 |
-| `Eduq` | ysnd00(ysnd01 は 2026-11-03 時点で停止中) | AMD Instinct MI210 64GB × 2 | CPU 8、メモリ 64GB、GPU 2、8 時間。flint で約 30 トークン/秒 |
+| `Eduq` | ysnd00, ysnd01 | AMD Instinct MI210 64GB × 2 | CPU 8、メモリ 64GB、GPU 2、8 時間。flint で約 30 トークン/秒 |
 
 - どちらも同時実行は 1 人 1 ジョブ。2 つのキューは別々なので、iEduq と Eduq で 1 本ずつ同時に動かせる
 - ジョブが保留(H)になると、`review-pr` はジョブを取り消して終わる。ノードの不調の可能性があるので、`-H` で別のノードを指定する
