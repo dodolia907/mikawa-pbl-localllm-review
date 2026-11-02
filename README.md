@@ -55,6 +55,7 @@ tar --use-compress-program=zstd -xf ollama-linux-amd64-rocm.tar.zst -C ollama
 ```
 review-pr [オプション] <owner/repo> <PR番号>
 review-pr [オプション] <PR の URL>
+review-pr [オプション] <owner/repo>  (PR などを対話モードで選ぶ)
 review-pr                       (引数なし: 対話モードで順に選ぶ)
 
   -i, --interactive    対話モードで選ぶ(引数やオプションで指定した値が既定値になる)
@@ -73,6 +74,7 @@ review-pr                       (引数なし: 対話モードで順に選ぶ)
 ### 対話モード
 
 引数なしで実行すると、リポジトリを入力した後、次の項目を矢印キーか Vim のキーで選ぶ。
+`./review-pr TechnoTUT/dmxctl` のようにリポジトリだけを指定すると、PR の選択から始まる。
 
 - PR(オープンな PR の一覧。「その他」で番号を入力すれば、マージ済みの PR なども指定できる)
 - キューと GPU(iEduq × 1、Eduq × 1、Eduq × 2)

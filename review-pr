@@ -8,6 +8,7 @@ usage() {
   cat <<'EOF'
 Usage: review-pr [options] <owner/repo> <PR number>
        review-pr [options] <PR URL>
+       review-pr [options] <owner/repo>  (choose the PR and settings interactively)
        review-pr                       (no arguments: interactive mode)
 
 Options:
@@ -57,8 +58,9 @@ if (( ${#ARGS[@]} == 1 )) && [[ ${ARGS[0]} =~ github\.com/([^/]+/[^/]+)/pull/([0
   REPO=${BASH_REMATCH[1]} PR=${BASH_REMATCH[2]}
 elif (( ${#ARGS[@]} == 2 )) && [[ ${ARGS[0]} == */* && ${ARGS[1]} =~ ^[0-9]+$ ]]; then
   REPO=${ARGS[0]} PR=${ARGS[1]}
-elif (( ${#ARGS[@]} == 1 )) && [[ ${ARGS[0]} == */* ]] && (( INTERACTIVE )); then
-  REPO=${ARGS[0]}                     # -i でリポジトリだけ指定し、PR は対話で選ぶ
+elif (( ${#ARGS[@]} == 1 )) && [[ ${ARGS[0]} == */* ]] && { (( INTERACTIVE )) || [ -t 0 ]; }; then
+  REPO=${ARGS[0]}                     # リポジトリだけ指定されたら、PR などは対話で選ぶ
+  INTERACTIVE=1
 elif (( ${#ARGS[@]} == 0 )) && [ -t 0 ]; then
   INTERACTIVE=1                       # 引数なしで端末から実行されたら対話モード
 else
@@ -232,12 +234,18 @@ TTY=0; [ -t 2 ] && TTY=1
 VERBS=(Simmering Pondering Brewing Percolating Cogitating Mulling Ruminating Noodling
        Deliberating Marinating Contemplating Musing Churning Stewing Puzzling Scheming)
 GLYPHS=('·' '✢' '✳' '✶' '✻' '✽' '✻' '✶' '✳' '✢')
+FRAME=0.1                                     # 状態表示を描き直す間隔(秒)
 VERB=${VERBS[RANDOM % ${#VERBS[@]}]}
 OFF=0 PARTIAL= SECTION= PHASE="queued" LASTPHASE= TOKENS=0 TICK=0
-START=$(date +%s) LAST_QSTAT=0 STATE=Q
+printf -v START '%(%s)T' -1
+STATE=Q QSTAT_PID= QSTAT_AT=0 QSTATE_FILE=$RUN/.qstate
+# sleep コマンドを起動せずに待つため、何も書かれないパイプを read -t で待つ
+exec {SLEEP_FD}<> <(:)
 
-fmt_time() { local s=$1; (( s >= 60 )) && printf '%dm %ds' $((s / 60)) $((s % 60)) || printf '%ds' "$s"; }
-fmt_tokens() { local n=$1; (( n >= 1000 )) && printf '%d.%dk' $((n / 1000)) $((n % 1000 / 100)) || printf '%d' "$n"; }
+# 描き直しのたびに外部コマンドを起動しないよう、時刻や整形は bash の組み込み機能だけで行う
+# fmt_time <変数名> <秒>、fmt_tokens <変数名> <数>
+fmt_time() { if (( $2 >= 60 )); then printf -v "$1" '%dm %ds' $(($2 / 60)) $(($2 % 60)); else printf -v "$1" '%ds' "$2"; fi; }
+fmt_tokens() { if (( $2 >= 1000 )); then printf -v "$1" '%d.%dk' $(($2 / 1000)) $(($2 % 1000 / 100)); else printf -v "$1" '%d' "$2"; fi; }
 
 # 状態表示の行を消す(端末のときだけ)
 clear_status() { (( TTY )) && printf '\r\e[K' >&2 || true; }
@@ -276,14 +284,35 @@ pump_stream() {
   fi
 }
 
+# ジョブの状態を確認する。qstat は 0.2 秒ほどかかって描き直しが止まるので、
+# バックグラウンドで実行して結果をファイルで受け取る(5 秒ごと)
+poll_qstat() {
+  local now
+  if [ -n "$QSTAT_PID" ]; then
+    kill -0 "$QSTAT_PID" 2>/dev/null && return 0          # まだ実行中
+    wait "$QSTAT_PID" 2>/dev/null || true
+    QSTAT_PID=
+    STATE=
+    [ -f "$QSTATE_FILE" ] && read -r STATE < "$QSTATE_FILE" || true
+  fi
+  printf -v now '%(%s)T' -1
+  if (( now - QSTAT_AT >= 5 )); then
+    QSTAT_AT=$now
+    { qstat -f "$JOB" 2>/dev/null | awk '/job_state =/ {print $3}' > "$QSTATE_FILE.tmp"
+      mv -f "$QSTATE_FILE.tmp" "$QSTATE_FILE"; } &
+    QSTAT_PID=$!
+  fi
+}
+
 # 段階(phase)を決める: キュー待ち → ジョブ側の進み具合 → 生成の段階
 update_phase() {
-  local stat p n
+  local p n now el
+  local -a pl
   case $STATE in
     Q) PHASE="queued" ;;
     E) PHASE="finishing" ;;
     R) PHASE="starting"
-       [ -f "$RUN/progress" ] && PHASE=$(tail -1 "$RUN/progress" | tr 'A-Z' 'a-z')
+       if [ -s "$RUN/progress" ]; then mapfile -t pl < "$RUN/progress"; PHASE=${pl[-1],,}; fi
        if [ -f "$STREAM.stat" ] && read -r p n < "$STREAM.stat" 2>/dev/null; then
          TOKENS=${n:-0}
          case $p in reading) PHASE="reading diff" ;; thinking) PHASE="thinking" ;;
@@ -293,7 +322,10 @@ update_phase() {
   if [ "$PHASE" != "$LASTPHASE" ]; then
     # 段階が変わったら言葉も変える。端末でないときは、段階の変化を 1 行ずつ記録する
     VERB=${VERBS[RANDOM % ${#VERBS[@]}]}
-    (( TTY )) || echo "[$(fmt_time $(( $(date +%s) - START )))] $PHASE" >&2
+    if (( !TTY )); then
+      printf -v now '%(%s)T' -1; fmt_time el $(( now - START ))
+      echo "[$el] $PHASE" >&2
+    fi
     LASTPHASE=$PHASE
   fi
 }
@@ -301,16 +333,16 @@ update_phase() {
 # 一番下の状態表示の行: ✻ Simmering… (1m 12s · 3.4k tokens · thinking)  途中の行…
 draw_status() {
   (( TTY )) || return 0
-  local el ptail info
-  el=$(fmt_time $(( $(date +%s) - START )))
-  info="$el"
-  (( TOKENS > 0 )) && info+=" · $(fmt_tokens "$TOKENS") tokens"
+  local now el tk info ptail
+  printf -v now '%(%s)T' -1
+  fmt_time el $(( now - START ))
+  info=$el
+  if (( TOKENS > 0 )); then fmt_tokens tk "$TOKENS"; info+=" · $tk tokens"; fi
   info+=" · $PHASE"
   ptail=${PARTIAL: -60}
-  # 折り返しを止めて描く(長い行は画面の端で切れる)
-  printf '\e[?7l\r\e[K%s %s… %s%s' "${CYAN}${GLYPHS[TICK % ${#GLYPHS[@]}]}${RESET}" "${BOLD}${VERB}${RESET}" \
+  # 折り返しを止めて 1 回の書き込みで描く(長い行は画面の端で切れる)
+  printf '\e[?7l\r%s %s… %s%s\e[K\e[?7h' "${CYAN}${GLYPHS[TICK % ${#GLYPHS[@]}]}${RESET}" "${BOLD}${VERB}${RESET}" \
     "${DIM}(${info})" "${ptail:+  $ptail}${RESET}" >&2
-  printf '\e[?7h' >&2
   TICK=$(( TICK + 1 ))
 }
 
@@ -319,22 +351,21 @@ finish_status() { clear_status; (( TTY )) && printf '\e[?25h' >&2 || true; }
 # 待っている間に Ctrl-C されたら、ジョブも取り消す
 trap 'finish_status; echo; echo "Interrupted; cancelling job ${JOB%%.*}" >&2; qdel "$JOB" 2>/dev/null; exit 130' INT TERM
 (( TTY )) && printf '\e[?25l' >&2            # 状態表示の間はカーソルを隠す
+poll_qstat
 while :; do
-  now=$(date +%s)
-  if (( now - LAST_QSTAT >= 5 )); then       # キューの状態は 5 秒ごとに確認する
-    STATE=$(qstat -f "$JOB" 2>/dev/null | awk '/job_state =/ {print $3}') || true
-    LAST_QSTAT=$now
-    [ -z "$STATE" ] && break
-    if [ "$STATE" = H ]; then
-      qdel "$JOB" 2>/dev/null; finish_status
-      die "the job was held (H); the node may be unhealthy. Try another node with -H"
-    fi
+  poll_qstat
+  [ -z "$STATE" ] && break                   # qstat に出なくなったらジョブは終わっている
+  if [ "$STATE" = H ]; then
+    qdel "$JOB" 2>/dev/null; finish_status
+    die "the job was held (H); the node may be unhealthy. Try another node with -H"
   fi
-  update_phase
-  pump_stream
+  # ファイルを読む処理は 3 コマに 1 回(0.3 秒ごと)。記号は毎コマ回す
+  if (( TICK % 3 == 0 )); then update_phase; pump_stream; fi
   draw_status
-  sleep 0.12
+  (( TTY )) || TICK=$(( TICK + 1 ))
+  read -t "$FRAME" -u "$SLEEP_FD" _ || true
 done
+rm -f "$QSTATE_FILE"
 pump_stream                                  # 最後に残った分を出す
 [ -n "$PARTIAL" ] && { clear_status; emit_lines "$PARTIAL"; PARTIAL=; }
 finish_status
