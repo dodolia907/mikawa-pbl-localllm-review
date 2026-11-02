@@ -54,7 +54,9 @@ tar --use-compress-program=zstd -xf ollama-linux-amd64-rocm.tar.zst -C ollama
 ```
 review-pr [オプション] <owner/repo> <PR番号>
 review-pr [オプション] <PR の URL>
+review-pr                       (引数なし: 対話モードで順に選ぶ)
 
+  -i, --interactive    対話モードで選ぶ(引数やオプションで指定した値が既定値になる)
   -q, --queue QUEUE    使うキュー: iEduq(NVIDIA A100、既定)か Eduq(AMD MI210)
   -g, --gpus N         使う GPU 数(iEduq は 1、Eduq は 1〜2。既定 1)
   -H, --host NODE      ノードを固定する(例 yind01)
@@ -66,12 +68,32 @@ review-pr [オプション] <PR の URL>
 
 進み具合は標準エラーに、レビュー本文は標準出力に出るので、`> review.md` で本文だけ保存できる。
 
+### 対話モード
+
+引数なしで実行すると、リポジトリ、PR(オープンな PR の一覧から選ぶか番号を入力)、キュー、GPU 数(Eduq のとき)、
+モデル(取得済みの一覧から選ぶか名前を入力)、ノード、投稿するか、終わるまで待つかを順に聞く。
+最後に同じ内容を引数で指定するコマンドを表示し、確認してから実行する。
+
+```
+$ ./review-pr
+リポジトリ(owner/repo): TechnoTUT/dmxctl
+オープンな PR:
+  #4     リファクタリング: engine.rs / ui_map.rs の分割と clippy 対応  (dodolia907, +2661/-2428)
+PR 番号 [4]: 3
+  1) iEduq NVIDIA A100 80GB × 1(yind00/01)
+  2) Eduq  AMD MI210 64GB × 2(ysnd00)
+キュー [iEduq]: 2
+...
+実行するコマンド: review-pr -q Eduq TechnoTUT/dmxctl 3
+実行しますか?(y/n) [y]:
+```
+
 ### キュー
 
 | キュー | ノード | GPU | 1 ジョブの上限 |
 |---|---|---|---|
-| `iEduq` | yind00, yind01 | NVIDIA A100 80GB × 1 | CPU 8、メモリ 64GB、8 時間 |
-| `Eduq` | ysnd00(ysnd01 は 2026-11-03 時点で停止中) | AMD Instinct MI210 64GB × 2 | CPU 8、メモリ 64GB、GPU 2、8 時間 |
+| `iEduq` | yind00, yind01 | NVIDIA A100 80GB × 1 | CPU 8、メモリ 64GB、8 時間。flint で約 56 トークン/秒 |
+| `Eduq` | ysnd00(ysnd01 は 2026-11-03 時点で停止中) | AMD Instinct MI210 64GB × 2 | CPU 8、メモリ 64GB、GPU 2、8 時間。flint で約 30 トークン/秒 |
 
 - どちらも同時実行は 1 人 1 ジョブ。2 つのキューは別々なので、iEduq と Eduq で 1 本ずつ同時に動かせる
 - ジョブが保留(H)になると、`review-pr` はジョブを取り消して終わる。ノードの不調の可能性があるので、`-H` で別のノードを指定する
