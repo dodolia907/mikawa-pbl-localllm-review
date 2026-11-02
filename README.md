@@ -27,6 +27,7 @@ review-pr(窓口サーバ ydev)
 | `review.md` | レビュー |
 | `pr.json` / `pr.diff` | PR の情報と差分 |
 | `progress` | ジョブの進み具合 |
+| `stream.txt` / `stream.txt.stat` | 生成途中の出力 / 段階とトークン数 |
 | `job.log` / `ollama.log` | ジョブと Ollama のログ |
 
 ## 初回セットアップ(窓口サーバで 1 回だけ)
@@ -64,6 +65,7 @@ review-pr                       (引数なし: 対話モードで順に選ぶ)
   -o, --output FILE    レビューを FILE にも保存する
       --post           レビューを PR にコメントとして投稿する(投稿前に確認する)
       --no-wait        ジョブを投入したら待たずに終わる
+      --quiet          生成途中の出力を流さず、状態表示だけにする
 ```
 
 進み具合は標準エラーに、レビュー本文は標準出力に出るので、`> review.md` で本文だけ保存できる。
@@ -90,13 +92,30 @@ review-pr                       (引数なし: 対話モードで順に選ぶ)
 
 ```
 $ ./review-pr
-リポジトリ(owner/repo): TechnoTUT/dmxctl
-PR: #4  リファクタリング: engine.rs / ui_map.rs の分割と clippy 対応  (dodolia907, +2661/-2428)
-キューと GPU  (↑↓ / j k で移動、Enter で決定、q で中止)
-  iEduq  NVIDIA A100 80GB × 1(yind00/01)
-> Eduq   AMD MI210 64GB × 1(ysnd00/01)
-  Eduq   AMD MI210 64GB × 2(ysnd00/01。64GB を超える大きなモデル向け。…)
+Repository (owner/repo): TechnoTUT/dmxctl
+Pull request: #4  リファクタリング: engine.rs / ui_map.rs の分割と clippy 対応  (dodolia907, +2661/-2428)
+Queue / GPU  (↑↓ / j k to move, Enter to select, q to cancel)
+  iEduq  NVIDIA A100 80GB x1 (yind00/01)
+> Eduq   AMD MI210 64GB x1 (ysnd00/01)
+  Eduq   AMD MI210 64GB x2 (ysnd00/01; for models over 64GB, no speedup for models that fit on one)
 ```
+
+### 実行中の表示
+
+ジョブを待つ間、画面の一番下に Claude Code 風の状態表示の行を出し、モデルが生成した内容を上に流す。
+考える過程(thinking)は薄い色、レビュー本文は通常の色で表示する。
+
+```
+── thinking ──
+We need to review the CI workflow changes. The mac and windows jobs only run on ...
+✻ Deliberating… (2m 41s · 3.4k tokens · thinking)  so a push to a branch never builds
+```
+
+- 状態表示の行は、経過時間・生成したトークン数・段階(queued → starting ollama → loading model onto gpu → reading diff → thinking → writing review)を示す。末尾は生成途中の行
+- 本文はすでに画面に流れているので、終わった後は保存先だけを表示する。標準出力をリダイレクトしたときは、本文を出力する
+- `--quiet` を付けると、生成途中の出力を流さず、状態表示だけにする
+- 端末でないとき(ログに保存するときなど)は、アニメーションの代わりに段階の変化を 1 行ずつ出す
+- CLI が表示する文言は英語。レビュー本文は日本語(`review.py` のプロンプトで指定)
 
 ### キュー
 
