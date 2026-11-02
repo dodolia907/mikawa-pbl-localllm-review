@@ -11,7 +11,7 @@ export OLLAMA_KEEP_ALIVE=-1                # ジョブの間はモデルを GPU 
 OLLAMA_URL=http://$OLLAMA_HOST
 
 if [ ! -x "$OLLAMA" ]; then
-  echo "Ollama が見つかりません: $OLLAMA (README の手順で導入してください)" >&2; exit 1
+  echo "Ollama not found: $OLLAMA (install it as described in the README)" >&2; exit 1
 fi
 
 hostname
@@ -20,14 +20,14 @@ if command -v nvidia-smi > /dev/null; then      # iEduq: NVIDIA A100
 elif command -v rocm-smi > /dev/null; then      # Eduq: AMD MI210(Ollama 同梱の ROCm ライブラリを使う)
   rocm-smi --showproductname --showmeminfo vram 2>&1 | grep -E 'Card Series|VRAM Total Memory' || true
   if ! compgen -G "$LLM_HOME/ollama/lib/ollama/rocm*" > /dev/null; then   # v0.40.13 では rocm_v7_2
-    echo "Ollama の AMD(ROCm)版のライブラリがありません。README の手順で導入してください" >&2; exit 1
+    echo "Ollama ROCm libraries not found (install them as described in the README)" >&2; exit 1
   fi
 fi
 
 "$OLLAMA" serve > "${OLLAMA_LOG:-/dev/null}" 2>&1 &
 OLLAMA_PID=$!
 trap 'kill $OLLAMA_PID 2>/dev/null || true' EXIT
-echo "Ollama を起動中"
+echo "Starting Ollama"
 for _ in $(seq 60); do curl -sf "$OLLAMA_URL/api/version" >/dev/null && break; sleep 2; done
 
 # モデルのファイル(blob)を curl で先に取得する。
@@ -41,7 +41,7 @@ fetch_blobs() {
   case $name in */*) repo=$name ;; *) repo=library/$name ;; esac
   local manifest
   manifest=$(curl -sfL -m 60 -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
-    "$REGISTRY/v2/$repo/manifests/$tag") || { echo "fetch $m: 目録を取得できません" >&2; return 1; }
+    "$REGISTRY/v2/$repo/manifests/$tag") || { echo "fetch $m: cannot get the manifest" >&2; return 1; }
   mkdir -p "$OLLAMA_MODELS/blobs"
   python3 -c 'import json,sys; m=json.load(sys.stdin)
 for l in m["layers"] + [m["config"]]: print(l["digest"], l["size"])' <<< "$manifest" |
@@ -52,14 +52,14 @@ for l in m["layers"] + [m["config"]]: print(l["digest"], l["size"])' <<< "$manif
     for try in $(seq 30); do
       curl -sfL -C - --speed-limit 1000000 --speed-time 30 -m 3600 -o "$tmp" \
         "$REGISTRY/v2/$repo/blobs/$digest" && break
-      echo "fetch $m: ${digest:7:12} 遅いか切れたので再接続 ($try/30, $(( $(stat -c %s "$tmp" 2>/dev/null || echo 0) / 1000000 ))/$((size / 1000000)) MB)"
+      echo "fetch $m: ${digest:7:12} slow or dropped, reconnecting ($try/30, $(( $(stat -c %s "$tmp" 2>/dev/null || echo 0) / 1000000 ))/$((size / 1000000)) MB)"
     done
     if [ "$(stat -c %s "$tmp" 2>/dev/null)" = "$size" ] && \
        [ "$(sha256sum "$tmp" | cut -d' ' -f1)" = "${digest#sha256:}" ]; then
       mv "$tmp" "$dest"; rm -f "$dest"-partial*     # ollama pull の取得途中のファイルは不要になる
-      echo "fetch $m: ${digest:7:12} 完了 ($((size / 1000000)) MB)"
+      echo "fetch $m: ${digest:7:12} done ($((size / 1000000)) MB)"
     else
-      echo "fetch $m: ${digest:7:12} 取得失敗" >&2; rm -f "$tmp"; return 1
+      echo "fetch $m: ${digest:7:12} failed" >&2; rm -f "$tmp"; return 1
     fi
   done
 }
@@ -68,8 +68,8 @@ for l in m["layers"] + [m["config"]]: print(l["digest"], l["size"])' <<< "$manif
 # curl での事前取得に失敗した場合に備え、ollama pull も止まったら中断してやり直す。
 pull_model() {
   local m=$1 try size last stalled
-  echo "モデル $m を用意中(初回は取得に 10 分ほどかかる)"
-  fetch_blobs "$m" || echo "fetch $m: 事前取得に失敗したので ollama pull に任せる"
+  echo "Preparing model $m (first download takes about 10 minutes)"
+  fetch_blobs "$m" || echo "fetch $m: prefetch failed, falling back to ollama pull"
   for try in 1 2 3 4 5; do
     "$OLLAMA" pull "$m" > /dev/null 2>&1 &
     local pid=$! last=-1 stalled=0
@@ -78,28 +78,28 @@ pull_model() {
       size=$(du -sk "$OLLAMA_MODELS" | cut -f1)   # 実際に書き込まれた量(KB)
       if [ "$size" = "$last" ]; then stalled=$((stalled + 15)); else stalled=0; last=$size; fi
       if [ $stalled -ge "${STALL_SEC:-180}" ]; then
-        echo "pull $m: ${stalled} 秒進まないので再試行 ($try/5)"; kill $pid; break
+        echo "pull $m: no progress for ${stalled}s, retrying ($try/5)"; kill $pid; break
       fi
     done
-    if wait $pid; then echo "pull $m: 完了"; return 0; fi
+    if wait $pid; then echo "pull $m: done"; return 0; fi
   done
-  echo "pull $m: 失敗" >&2; return 1
+  echo "pull $m: failed" >&2; return 1
 }
 # モデルを読み込み、GPU に載ったことを確かめる。
 # CUDA の初期化に失敗すると Ollama は黙って CPU で動き、レビュー 1 件に何十分もかかる。
 # その場合は続けずにエラーで終わる(同じ手順でも GPU に載る回と載らない回があった)。
 load_on_gpu() {
   local m=$1 vram
-  echo "モデル $m を GPU に読み込み中"
+  echo "Loading model onto GPU"
   curl -sf -m 600 "$OLLAMA_URL/api/generate" -d "{\"model\":\"$m\",\"keep_alive\":-1}" > /dev/null
   vram=$(curl -sf "$OLLAMA_URL/api/ps" | python3 -c 'import json,sys,os
 print(sum(x.get("size_vram",0) for x in json.load(sys.stdin)["models"] if x["name"]==sys.argv[1] or x["model"]==sys.argv[1]))' "$m")
   if [ "${vram:-0}" -le 0 ]; then
-    echo "load $m: GPU に載りませんでした(CPU で動いている)。ollama のログで GPU のエラーを確認してください" >&2
+    echo "load $m: the model did not load onto the GPU (it would run on CPU); check the Ollama log for GPU errors" >&2
     grep -m3 -iE '(cuda|rocm|hip).*(fail|error)' "${OLLAMA_LOG:-/dev/null}" >&2 || true
     return 1
   fi
-  echo "load $m: GPU に $((vram / 1024 / 1024)) MiB 載りました"
+  echo "load $m: $((vram / 1024 / 1024)) MiB on GPU"
 }
 
 pull_model "$MODEL"

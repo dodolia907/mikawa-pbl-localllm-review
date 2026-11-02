@@ -7,14 +7,14 @@ QUEUE=${QUEUE:-iEduq}
 case $QUEUE in
   iEduq) SIF=/common/Singularity_sif/prg_env_intel_2025.02.sif; MAX_GPUS=1; NODES="yind00 yind01" ;;
   Eduq)  SIF=/common/Singularity_sif/prg_env_amd_2025.02.sif;   MAX_GPUS=2; NODES="ysnd00 ysnd01" ;;
-  *) echo "未対応のキューです: $QUEUE(iEduq か Eduq)" >&2; exit 1 ;;
+  *) echo "unsupported queue: $QUEUE (use iEduq or Eduq)" >&2; exit 1 ;;
 esac
 if [ -n "${HOST:-}" ] && [[ " $NODES " != *" $HOST "* ]]; then
-  echo "$QUEUE のノードは $NODES です(HOST=$HOST)" >&2; exit 1
+  echo "$QUEUE nodes are: $NODES (HOST=$HOST)" >&2; exit 1
 fi
 NGPUS=${NGPUS:-1}
 if (( NGPUS < 1 || NGPUS > MAX_GPUS )); then
-  echo "$QUEUE で使える GPU は 1〜$MAX_GPUS 枚です(NGPUS=$NGPUS)" >&2; exit 1
+  echo "$QUEUE allows 1-$MAX_GPUS GPUs (NGPUS=$NGPUS)" >&2; exit 1
 fi
 QSUB_ARGS=(-q "$QUEUE" -l "select=1:ncpus=8:mem=64gb:ngpus=$NGPUS${HOST:+:host=$HOST}")
 # -v はジョブスクリプトの #PBS -v を丸ごと置き換えるので、コンテナの指定も必ず含める
