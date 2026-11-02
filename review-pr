@@ -283,6 +283,7 @@ TTY=0; [ -t 2 ] && TTY=1
 VERBS=(Simmering Pondering Brewing Percolating Cogitating Mulling Ruminating Noodling
        Deliberating Marinating Contemplating Musing Churning Stewing Puzzling Scheming)
 FRAME=0.1                                     # 状態表示を描き直す間隔(秒)
+SHINE=; [ -n "$BOLD" ] && SHINE=$'\e[1;96m'   # 動詞の上を流れる明るい帯の色(明るいシアン)
 VERB=${VERBS[RANDOM % ${#VERBS[@]}]}
 OFF=0 PARTIAL= SECTION= PHASE="queued" LASTPHASE= TOKENS=0 TICK=0
 printf -v START '%(%s)T' -1
@@ -433,7 +434,7 @@ update_phase() {
 # 一番下の状態表示の行: Simmering… (1m 12s · 3.4k tokens · thinking)  途中の行…
 draw_status() {
   (( TTY )) || return 0
-  local now el tk info ptail
+  local now el tk info ptail verb
   printf -v now '%(%s)T' -1
   fmt_time el $(( now - START ))
   info=$el
@@ -441,8 +442,22 @@ draw_status() {
   info+=" · $PHASE"
   ptail=${PARTIAL: -60}
   # 折り返しを止めて 1 回の書き込みで描く(長い行は画面の端で切れる)
-  printf '\e[?7l\r%s… %s%s\e[K\e[?7h' "${BOLD}${VERB}${RESET}" "${DIM}(${info})" "${ptail:+  $ptail}${RESET}" >&2
+  shimmer verb "$VERB"
+  printf '\e[?7l\r%s…%s %s%s\e[K\e[?7h' "$verb" "$RESET" "${DIM}(${info})" "${ptail:+  $ptail}${RESET}" >&2
   TICK=$(( TICK + 1 ))
+}
+
+# shimmer <変数名> <文字列>: 明るい帯(3 文字)が 1 コマに 1 文字ずつ左から右へ流れるように色を付ける。
+# 帯が文字列の外にいる間(8 コマ)は何も光らず、間が空く
+shimmer() {
+  local n=${#2} p a b
+  p=$(( TICK % (n + 8) - 3 ))                 # 帯の左端
+  a=$(( p < 0 ? 0 : p )) b=$(( p + 3 > n ? n : p + 3 ))
+  if [ -n "$SHINE" ] && (( a < b )); then
+    printf -v "$1" '%s%s%s%s%s%s' "$BOLD" "${2:0:a}" "$SHINE" "${2:a:b-a}" "$RESET$BOLD" "${2:b}"
+  else
+    printf -v "$1" '%s%s' "$BOLD" "$2"
+  fi
 }
 
 finish_status() { clear_status; (( TTY )) && printf '\e[?25h' >&2 || true; }
