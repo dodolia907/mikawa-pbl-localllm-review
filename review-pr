@@ -71,21 +71,55 @@ ask() {
   read -r -e -p "$_ask_q${_ask_def:+ [$_ask_def]}: " _ask_in < /dev/tty || { echo; echo "中止しました" >&2; exit 1; }
   printf -v "$_ask_var" '%s' "${_ask_in:-$_ask_def}"
 }
-# choose <変数名> <質問> <既定値> <選択肢...>: 番号か値そのもので選ぶ(一覧にない値も入力できる)
-choose() {
-  local _ch_var=$1 _ch_q=$2 _ch_def=$3 _ch_ans _ch_i; shift 3
-  local _ch_opts=("$@")
-  for _ch_i in "${!_ch_opts[@]}"; do printf '  %d) %s\n' $((_ch_i + 1)) "${_ch_opts[_ch_i]}" >&2; done
-  ask _ch_ans "$_ch_q" "$_ch_def"
-  if [[ $_ch_ans =~ ^[0-9]+$ ]] && (( _ch_ans >= 1 && _ch_ans <= ${#_ch_opts[@]} )); then
-    _ch_ans=${_ch_opts[_ch_ans - 1]%% *}      # 「値 説明」の形の選択肢は、値だけを取る
-  fi
-  printf -v "$_ch_var" '%s' "$_ch_ans"
+# menu <変数名> <見出し> <既定値> <"値<TAB>表示">...: 矢印キーか j/k で選ぶ。
+#   ↑/k: 上、↓/j: 下、g/G: 先頭/末尾、1〜9: その番号へ、Enter: 決定、q: 中止
+menu() {
+  local _mn_var=$1 _mn_title=$2 _mn_def=$3; shift 3
+  local -a _mn_val=() _mn_lab=()
+  local _mn_o _mn_i _mn_sel=0 _mn_n _mn_key _mn_rest
+  for _mn_o in "$@"; do _mn_val+=("${_mn_o%%$'\t'*}"); _mn_lab+=("${_mn_o#*$'\t'}"); done
+  _mn_n=${#_mn_val[@]}
+  for _mn_i in "${!_mn_val[@]}"; do
+    if [ "${_mn_val[_mn_i]}" = "$_mn_def" ]; then _mn_sel=$_mn_i; fi
+  done
+  {
+    printf '%s  \e[2m(↑↓ / j k で移動、Enter で決定、q で中止)\e[0m\n' "$_mn_title"
+    # カーソルを隠し、行の折り返しを止める(長い行が折り返すと描き直しがずれるため。はみ出た分は見えない)
+    printf '\e[?25l\e[?7l'
+    while :; do
+      for _mn_i in "${!_mn_lab[@]}"; do
+        if (( _mn_i == _mn_sel )); then printf '\e[7m> %s\e[0m\e[K\n' "${_mn_lab[_mn_i]}"
+        else printf '  %s\e[K\n' "${_mn_lab[_mn_i]}"; fi
+      done
+      IFS= read -rsn1 _mn_key < /dev/tty || _mn_key=q
+      if [[ $_mn_key == $'\e' ]]; then        # 矢印キーは ESC [ A のような 3 文字で届く
+        IFS= read -rsn2 -t 0.1 _mn_rest < /dev/tty || true
+        _mn_key+=$_mn_rest
+      fi
+      case $_mn_key in
+        $'\e[A'|k) _mn_sel=$(( (_mn_sel + _mn_n - 1) % _mn_n )) ;;
+        $'\e[B'|j) _mn_sel=$(( (_mn_sel + 1) % _mn_n )) ;;
+        g) _mn_sel=0 ;;
+        G) _mn_sel=$(( _mn_n - 1 )) ;;
+        [1-9]) if (( _mn_key <= _mn_n )); then _mn_sel=$(( _mn_key - 1 )); fi ;;
+        '') break ;;
+        q) printf '\e[?25h\e[?7h中止しました\n'; exit 1 ;;
+      esac
+      printf '\e[%dA' "$_mn_n"            # 選択肢の先頭に戻って描き直す
+    done
+    # メニューを消して、選んだものだけを 1 行で残す
+    printf '\e[%dA\e[J\e[?25h\e[?7h' $(( _mn_n + 1 ))
+    printf '%s: \e[1m%s\e[0m\n' "$_mn_title" "${_mn_lab[_mn_sel]}"
+  } > /dev/tty
+  printf -v "$_mn_var" '%s' "${_mn_val[_mn_sel]}"
 }
 
 interactive() {
-  local list models=() m q
-  echo "== review-pr: 対話モード(空欄で [ ] 内の既定値、Ctrl-C で中止)" >&2
+  local -a opts=()
+  local m sel
+  # Ctrl-C で抜けても、隠したカーソルと止めた折り返しを戻す
+  trap 'printf "\e[?25h\e[?7h" > /dev/tty 2> /dev/null' EXIT
+  echo "== review-pr: 対話モード(Ctrl-C で中止)" >&2
 
   until [[ $REPO =~ ^[^/[:space:]]+/[^/[:space:]]+$ ]]; do
     [ -n "$REPO" ] && echo "  owner/repo の形で入力してください" >&2
@@ -93,49 +127,51 @@ interactive() {
   done
 
   if [ -z "$PR" ]; then
-    echo "オープンな PR:" >&2
-    list=$(gh pr list -R "$REPO" --state open --limit 30 \
+    mapfile -t opts < <(gh pr list -R "$REPO" --state open --limit 30 \
       --json number,title,author,isDraft,additions,deletions \
-      --template '{{range .}}{{printf "  #%-5v" .number}} {{.title}}  ({{.author.login}}, +{{.additions}}/-{{.deletions}}{{if .isDraft}}, draft{{end}}){{"\n"}}{{end}}') \
+      --jq '.[] | "\(.number)\t#\(.number)  \(.title)  (\(.author.login), +\(.additions)/-\(.deletions)\(if .isDraft then ", draft" else "" end))"') \
       || die "リポジトリを参照できません: $REPO"
-    if [ -n "$list" ]; then echo "$list" >&2; else echo "  (なし。マージ済みなどの PR も番号で指定できる)" >&2; fi
-    local first; first=$(sed -n '1s/^ *#\([0-9]*\).*/\1/p' <<< "$list")
+    if (( ${#opts[@]} )); then
+      menu PR "PR" "" "${opts[@]}" $'other\tその他(番号を入力。マージ済みの PR なども指定できる)'
+    else
+      echo "オープンな PR はありません(マージ済みなどの PR も番号で指定できる)" >&2
+      PR=other
+    fi
+    if [ "$PR" = other ]; then
+      PR=
+      until [[ $PR =~ ^[0-9]+$ ]]; do ask PR "PR 番号"; done
+    fi
   fi
-  until [[ $PR =~ ^[0-9]+$ ]]; do ask PR "PR 番号" "${first:-}"; PR=${PR#\#}; done
 
-  # キューと GPU 枚数をまとめて選ぶ。選択肢の値は「キュー:枚数」
-  local qg=
-  echo "キューと GPU:" >&2
-  until [[ $qg =~ ^(iEduq:1|Eduq:[12])$ ]]; do
-    [ -n "$qg" ] && echo "  番号か iEduq:1 / Eduq:1 / Eduq:2 で選んでください" >&2
-    choose qg "キューと GPU" "${QUEUE:-iEduq}:${NGPUS:-1}" \
-      "iEduq:1  NVIDIA A100 80GB × 1(yind00/01)" \
-      "Eduq:1   AMD MI210 64GB × 1(ysnd00/01)" \
-      "Eduq:2   AMD MI210 64GB × 2(ysnd00/01。64GB を超える大きなモデル向け。1 枚に載るモデルは速くならない)"
-    [[ $qg == *:* ]] || qg+=":1"      # キュー名だけなら 1 枚
-  done
-  QUEUE=${qg%:*} NGPUS=${qg#*:}
+  menu sel "キューと GPU" "${QUEUE:-iEduq}:${NGPUS:-1}" \
+    $'iEduq:1\tiEduq  NVIDIA A100 80GB × 1(yind00/01)' \
+    $'Eduq:1\tEduq   AMD MI210 64GB × 1(ysnd00/01)' \
+    $'Eduq:2\tEduq   AMD MI210 64GB × 2(ysnd00/01。64GB を超える大きなモデル向け。1 枚に載るモデルは速くならない)'
+  QUEUE=${sel%:*} NGPUS=${sel#*:}
 
   # 取得済みのモデル(/work/$USER/llm/models の目録)を選択肢にする
+  opts=()
   while IFS= read -r m; do
-    m=${m#*/manifests/*/}; m=${m#library/}; models+=("${m%/*}:${m##*/}")
+    m=${m#*/manifests/*/}; m=${m#library/}; m="${m%/*}:${m##*/}"
+    opts+=("$m"$'\t'"$m")
   done < <(find "${LLM_HOME:-/work/$USER/llm}/models/manifests" -mindepth 3 -type f 2>/dev/null | sort)
-  echo "モデル(取得済み。ほかのモデル名も入力できる。未取得なら初回に取得する):" >&2
-  choose MODEL "モデル" "$MODEL" "${models[@]}"
+  if ! printf '%s\n' "${opts[@]}" | grep -qxF "$MODEL"$'\t'"$MODEL"; then
+    opts=("$MODEL"$'\t'"$MODEL(未取得。初回に取得する)" "${opts[@]}")
+  fi
+  menu MODEL "モデル" "$MODEL" "${opts[@]}" $'other\tその他(モデル名を入力。未取得なら初回に取得する)'
+  if [ "$MODEL" = other ]; then
+    MODEL=
+    until [ -n "$MODEL" ]; do ask MODEL "モデル名(例 qwen3.8:27b-q8_0)"; done
+  fi
 
-  local nodes; [ "$QUEUE" = Eduq ] && nodes="ysnd00 ysnd01" || nodes="yind00 yind01"
-  while :; do
-    ask HOST "ノードを固定($nodes。空欄で自動)" "${HOST:-}"
-    [ -z "$HOST" ] || [[ " $nodes " == *" $HOST "* ]] && break
-    echo "  $QUEUE のノードは $nodes です" >&2; HOST=
-  done
-  q=n; (( POST )) && q=y
-  ask q "レビューを PR にコメントとして投稿する?(投稿前にもう一度確認する)(y/n)" "$q"
-  [[ $q == [yY]* ]] && POST=1 || POST=0
-  q=y; (( WAIT )) || q=n
-  if (( !POST )); then
-    ask q "終わるまで待って結果を表示する?(y/n)" "$q"
-    [[ $q == [yY]* ]] && WAIT=1 || WAIT=0
+  if [ "$QUEUE" = Eduq ]; then opts=(ysnd00 ysnd01); else opts=(yind00 yind01); fi
+  menu HOST "ノード" "${HOST:-}" $'\t自動(空いているノード)' "${opts[0]}"$'\t'"${opts[0]}" "${opts[1]}"$'\t'"${opts[1]}"
+
+  menu POST "PR へのコメント投稿" "$POST" $'0\t投稿しない' $'1\t投稿する(投稿前にレビューを見せて確認する)'
+  if (( POST )); then
+    WAIT=1
+  else
+    menu WAIT "終わるまで" "$WAIT" $'1\t待って結果を表示する' $'0\t投入したら終わる(結果は後でファイルを見る)'
   fi
 
   # 同じ内容を引数で指定するコマンド(次回からそのまま使える)
@@ -148,9 +184,9 @@ interactive() {
   (( POST )) && cmd+=" --post"
   (( WAIT )) || cmd+=" --no-wait"
   cmd+=" $REPO $PR"
-  echo >&2; echo "実行するコマンド: $cmd" >&2
-  ask q "実行しますか?(y/n)" y
-  [[ $q == [yY]* ]] || { echo "中止しました" >&2; exit 0; }
+  echo >&2; echo "同じ内容のコマンド: $cmd" >&2
+  menu sel "実行しますか" yes $'yes\t実行する' $'no\t中止する'
+  [ "$sel" = yes ] || { echo "中止しました" >&2; exit 0; }
 }
 (( INTERACTIVE )) && interactive
 
