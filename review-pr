@@ -212,13 +212,20 @@ gh pr view "$PR" -R "$REPO" --json number,title,body,author,baseRefName,headRefN
   > "$RUN/pr.json" || { rm -rf "$RUN"; die "cannot fetch pull request $REPO#$PR"; }
 gh pr diff "$PR" -R "$REPO" > "$RUN/pr.diff"
 TITLE=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["title"])' "$RUN/pr.json")
-CHARS=$(wc -c < "$RUN/pr.diff")
 echo "${BOLD}$REPO#$PR${RESET} $TITLE ${DIM}($(wc -l < "$RUN/pr.diff") diff lines)${RESET}" >&2
-(( CHARS > 160000 )) && echo "${RED}Note:${RESET} the diff exceeds ~160k characters; files near the end will not be reviewed" >&2
+# 大きな PR はファイルごとのパートに分けてレビューする(分け方は review.py と同じ関数で数える)
+NPARTS=$(cd "$ROOT" && python3 -I -c 'import sys; sys.path.insert(0, "."); import review
+print(len(review.make_parts(open(sys.argv[1], encoding="utf-8", errors="replace").read())))' "$RUN/pr.diff")
+(( NPARTS > 1 )) && echo "${DIM}Large diff: reviewing in $NPARTS parts, then merging the results${RESET}" >&2
+# ジョブの時間上限: 30 分 + パートごとに 15 分(Eduq は遅いので 2 倍)。最長 8 時間
+[ "$QUEUE" = Eduq ] && WALL_MIN=$(( 30 + NPARTS * 30 )) || WALL_MIN=$(( 30 + NPARTS * 15 ))
+(( NPARTS > 1 )) && WALL_MIN=$(( WALL_MIN + 15 ))   # まとめの分
+(( WALL_MIN > 480 )) && WALL_MIN=480
+printf -v WALL '%02d:%02d:00' $(( WALL_MIN / 60 )) $(( WALL_MIN % 60 ))
 
-JOB=$(qsub -o "$RUN/job.log" "${QSUB_ARGS[@]}" \
+JOB=$(qsub -o "$RUN/job.log" "${QSUB_ARGS[@]}" -l "walltime=$WALL" \
   -v "$QSUB_VARS,RUN_DIR=$RUN,MODEL=$MODEL,ROOT=$ROOT" "$ROOT/jobs/review.pbs")
-echo "${DIM}Job ${JOB%%.*} on $QUEUE (${NGPUS} GPU), model $MODEL${RESET}" >&2
+echo "${DIM}Job ${JOB%%.*} on $QUEUE (${NGPUS} GPU, up to $WALL), model $MODEL${RESET}" >&2
 echo "${DIM}Output: $RUN${RESET}" >&2
 if (( !WAIT )); then
   echo "Result will be written to $RUN/review.md (check with: qstat $JOB)" >&2
@@ -306,17 +313,23 @@ poll_qstat() {
 
 # 段階(phase)を決める: キュー待ち → ジョブ側の進み具合 → 生成の段階
 update_phase() {
-  local p n now el
+  local p n part total now el
   local -a pl
   case $STATE in
     Q) PHASE="queued" ;;
     E) PHASE="finishing" ;;
     R) PHASE="starting"
        if [ -s "$RUN/progress" ]; then mapfile -t pl < "$RUN/progress"; PHASE=${pl[-1],,}; fi
-       if [ -f "$STREAM.stat" ] && read -r p n < "$STREAM.stat" 2>/dev/null; then
+       if [ -f "$STREAM.stat" ] && read -r p n part total < "$STREAM.stat" 2>/dev/null; then
          TOKENS=${n:-0}
          case $p in reading) PHASE="reading diff" ;; thinking) PHASE="thinking" ;;
                     writing) PHASE="writing review" ;; done) PHASE="done" ;; esac
+         # パートに分けているときは、何番目のパートか(またはまとめ中か)を前に付ける
+         case ${part:--} in
+           -) ;;
+           merge) [ "$p" = done ] || PHASE="merging parts · $PHASE" ;;
+           *) PHASE="part $part/$total · $PHASE" ;;
+         esac
        fi ;;
   esac
   if [ "$PHASE" != "$LASTPHASE" ]; then
