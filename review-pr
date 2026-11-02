@@ -1,26 +1,28 @@
 #!/bin/bash
 # ローカル LLM で GitHub の PR をレビューする CLI。窓口サーバ(ydev)で実行する。
 # PR の情報と差分を gh で取得し、GPU ノードにジョブを投入し、終わるのを待ってレビューを表示する。
+# 画面に出す文言は英語(レビュー本文の言語は review.py のプロンプトで決まる)。
 set -euo pipefail
 
 usage() {
   cat <<'EOF'
-使い方: review-pr [オプション] <owner/repo> <PR番号>
-        review-pr [オプション] <PR の URL>
-        review-pr                       (引数なし: 対話モードで順に選ぶ)
+Usage: review-pr [options] <owner/repo> <PR number>
+       review-pr [options] <PR URL>
+       review-pr                       (no arguments: interactive mode)
 
-オプション:
-  -i, --interactive    対話モードで選ぶ(引数やオプションで指定した値が既定値になる)
-  -q, --queue QUEUE    使うキュー: iEduq(NVIDIA A100、既定)か Eduq(AMD MI210)
-  -g, --gpus N         使う GPU 数(iEduq は 1、Eduq は 1〜2。既定 1)
-  -H, --host NODE      ノードを固定する(例 yind01)
-  -m, --model MODEL    Ollama のモデル(既定 flint:40b)
-  -o, --output FILE    レビューを FILE にも保存する
-      --post           レビューを PR にコメントとして投稿する(投稿前に確認する)
-      --no-wait        ジョブを投入したら待たずに終わる
-  -h, --help           この説明を表示する
+Options:
+  -i, --interactive    Choose settings interactively (given arguments become defaults)
+  -q, --queue QUEUE    Queue: iEduq (NVIDIA A100, default) or Eduq (AMD MI210)
+  -g, --gpus N         Number of GPUs (iEduq: 1, Eduq: 1-2; default 1)
+  -H, --host NODE      Pin the job to a node (e.g. yind01)
+  -m, --model MODEL    Ollama model (default flint:40b)
+  -o, --output FILE    Also save the review to FILE
+      --post           Post the review as a PR comment (asks for confirmation first)
+      --no-wait        Submit the job and exit without waiting
+      --quiet          Do not stream the model's output; show progress only
+  -h, --help           Show this help
 
-例:
+Examples:
   review-pr TechnoTUT/dmxctl 3
   review-pr https://github.com/TechnoTUT/dmxctl/pull/3
   review-pr -q Eduq -m qwen3.8:27b-q8_0 TechnoTUT/dmxctl 3
@@ -31,7 +33,7 @@ die() { echo "review-pr: $*" >&2; exit 1; }
 
 ROOT=$(cd "$(dirname "$(realpath "$0")")" && pwd)
 MODEL=flint:40b
-OUTPUT= POST=0 WAIT=1 INTERACTIVE=0
+OUTPUT= POST=0 WAIT=1 INTERACTIVE=0 QUIET=0
 REPO= PR=
 ARGS=()
 while (( $# )); do
@@ -44,8 +46,9 @@ while (( $# )); do
     -o|--output) OUTPUT=${2:?}; shift 2 ;;
     --post)      POST=1; shift ;;
     --no-wait)   WAIT=0; shift ;;
+    --quiet)     QUIET=1; shift ;;
     -h|--help)   usage; exit 0 ;;
-    -*)          usage >&2; die "不明なオプションです: $1" ;;
+    -*)          usage >&2; die "unknown option: $1" ;;
     *)           ARGS+=("$1"); shift ;;
   esac
 done
@@ -61,16 +64,24 @@ elif (( ${#ARGS[@]} == 0 )) && [ -t 0 ]; then
 else
   usage >&2; exit 1
 fi
-command -v gh > /dev/null || die "gh が見つかりません"
+command -v gh > /dev/null || die "gh not found"
+
+# 端末に出すときだけ色や記号を使う
+if [ -t 2 ]; then
+  DIM=$'\e[2m' BOLD=$'\e[1m' CYAN=$'\e[36m' RED=$'\e[31m' RESET=$'\e[0m'
+else
+  DIM= BOLD= CYAN= RED= RESET=
+fi
 
 # ---- 対話モード ----------------------------------------------------------
 # ask <変数名> <質問> [既定値]: 入力を変数に入れる。空欄なら既定値。
 ask() {
   # 呼び出し側の変数名と重ならないよう、ローカル変数は _ask_ で始める
   local _ask_var=$1 _ask_q=$2 _ask_def=${3:-} _ask_in
-  read -r -e -p "$_ask_q${_ask_def:+ [$_ask_def]}: " _ask_in < /dev/tty || { echo; echo "中止しました" >&2; exit 1; }
+  read -r -e -p "$_ask_q${_ask_def:+ [$_ask_def]}: " _ask_in < /dev/tty || { echo; echo "Cancelled." >&2; exit 1; }
   printf -v "$_ask_var" '%s' "${_ask_in:-$_ask_def}"
 }
+
 # menu <変数名> <見出し> <既定値> <"値<TAB>表示">...: 矢印キーか j/k で選ぶ。
 #   ↑/k: 上、↓/j: 下、g/G: 先頭/末尾、1〜9: その番号へ、Enter: 決定、q: 中止
 menu() {
@@ -83,7 +94,7 @@ menu() {
     if [ "${_mn_val[_mn_i]}" = "$_mn_def" ]; then _mn_sel=$_mn_i; fi
   done
   {
-    printf '%s  \e[2m(↑↓ / j k で移動、Enter で決定、q で中止)\e[0m\n' "$_mn_title"
+    printf '%s  \e[2m(↑↓ / j k to move, Enter to select, q to cancel)\e[0m\n' "$_mn_title"
     # カーソルを隠し、行の折り返しを止める(長い行が折り返すと描き直しがずれるため。はみ出た分は見えない)
     printf '\e[?25l\e[?7l'
     while :; do
@@ -103,7 +114,7 @@ menu() {
         G) _mn_sel=$(( _mn_n - 1 )) ;;
         [1-9]) if (( _mn_key <= _mn_n )); then _mn_sel=$(( _mn_key - 1 )); fi ;;
         '') break ;;
-        q) printf '\e[?25h\e[?7h中止しました\n'; exit 1 ;;
+        q) printf '\e[?25h\e[?7hCancelled.\n'; exit 1 ;;
       esac
       printf '\e[%dA' "$_mn_n"            # 選択肢の先頭に戻って描き直す
     done
@@ -119,34 +130,34 @@ interactive() {
   local m sel
   # Ctrl-C で抜けても、隠したカーソルと止めた折り返しを戻す
   trap 'printf "\e[?25h\e[?7h" > /dev/tty 2> /dev/null' EXIT
-  echo "== review-pr: 対話モード(Ctrl-C で中止)" >&2
+  echo "== review-pr: interactive mode (Ctrl-C to cancel)" >&2
 
   until [[ $REPO =~ ^[^/[:space:]]+/[^/[:space:]]+$ ]]; do
-    [ -n "$REPO" ] && echo "  owner/repo の形で入力してください" >&2
-    ask REPO "リポジトリ(owner/repo)"
+    [ -n "$REPO" ] && echo "  Enter it as owner/repo" >&2
+    ask REPO "Repository (owner/repo)"
   done
 
   if [ -z "$PR" ]; then
     mapfile -t opts < <(gh pr list -R "$REPO" --state open --limit 30 \
       --json number,title,author,isDraft,additions,deletions \
       --jq '.[] | "\(.number)\t#\(.number)  \(.title)  (\(.author.login), +\(.additions)/-\(.deletions)\(if .isDraft then ", draft" else "" end))"') \
-      || die "リポジトリを参照できません: $REPO"
+      || die "cannot access repository: $REPO"
     if (( ${#opts[@]} )); then
-      menu PR "PR" "" "${opts[@]}" $'other\tその他(番号を入力。マージ済みの PR なども指定できる)'
+      menu PR "Pull request" "" "${opts[@]}" $'other\tOther (enter a number; merged PRs work too)'
     else
-      echo "オープンな PR はありません(マージ済みなどの PR も番号で指定できる)" >&2
+      echo "No open pull requests (you can still enter the number of a merged one)" >&2
       PR=other
     fi
     if [ "$PR" = other ]; then
       PR=
-      until [[ $PR =~ ^[0-9]+$ ]]; do ask PR "PR 番号"; done
+      until [[ $PR =~ ^[0-9]+$ ]]; do ask PR "PR number"; done
     fi
   fi
 
-  menu sel "キューと GPU" "${QUEUE:-iEduq}:${NGPUS:-1}" \
-    $'iEduq:1\tiEduq  NVIDIA A100 80GB × 1(yind00/01)' \
-    $'Eduq:1\tEduq   AMD MI210 64GB × 1(ysnd00/01)' \
-    $'Eduq:2\tEduq   AMD MI210 64GB × 2(ysnd00/01。64GB を超える大きなモデル向け。1 枚に載るモデルは速くならない)'
+  menu sel "Queue / GPU" "${QUEUE:-iEduq}:${NGPUS:-1}" \
+    $'iEduq:1\tiEduq  NVIDIA A100 80GB x1 (yind00/01)' \
+    $'Eduq:1\tEduq   AMD MI210 64GB x1 (ysnd00/01)' \
+    $'Eduq:2\tEduq   AMD MI210 64GB x2 (ysnd00/01; for models over 64GB, no speedup for models that fit on one)'
   QUEUE=${sel%:*} NGPUS=${sel#*:}
 
   # 取得済みのモデル(/work/$USER/llm/models の目録)を選択肢にする
@@ -156,22 +167,22 @@ interactive() {
     opts+=("$m"$'\t'"$m")
   done < <(find "${LLM_HOME:-/work/$USER/llm}/models/manifests" -mindepth 3 -type f 2>/dev/null | sort)
   if ! printf '%s\n' "${opts[@]}" | grep -qxF "$MODEL"$'\t'"$MODEL"; then
-    opts=("$MODEL"$'\t'"$MODEL(未取得。初回に取得する)" "${opts[@]}")
+    opts=("$MODEL"$'\t'"$MODEL (not downloaded yet; fetched on first use)" "${opts[@]}")
   fi
-  menu MODEL "モデル" "$MODEL" "${opts[@]}" $'other\tその他(モデル名を入力。未取得なら初回に取得する)'
+  menu MODEL "Model" "$MODEL" "${opts[@]}" $'other\tOther (enter a model name; fetched on first use)'
   if [ "$MODEL" = other ]; then
     MODEL=
-    until [ -n "$MODEL" ]; do ask MODEL "モデル名(例 qwen3.8:27b-q8_0)"; done
+    until [ -n "$MODEL" ]; do ask MODEL "Model name (e.g. qwen3.8:27b-q8_0)"; done
   fi
 
   if [ "$QUEUE" = Eduq ]; then opts=(ysnd00 ysnd01); else opts=(yind00 yind01); fi
-  menu HOST "ノード" "${HOST:-}" $'\t自動(空いているノード)' "${opts[0]}"$'\t'"${opts[0]}" "${opts[1]}"$'\t'"${opts[1]}"
+  menu HOST "Node" "${HOST:-}" $'\tAny (whichever is free)' "${opts[0]}"$'\t'"${opts[0]}" "${opts[1]}"$'\t'"${opts[1]}"
 
-  menu POST "PR へのコメント投稿" "$POST" $'0\t投稿しない' $'1\t投稿する(投稿前にレビューを見せて確認する)'
+  menu POST "Post to PR" "$POST" $'0\tDo not post' $'1\tPost as a PR comment (shows the review and asks first)'
   if (( POST )); then
     WAIT=1
   else
-    menu WAIT "終わるまで" "$WAIT" $'1\t待って結果を表示する' $'0\t投入したら終わる(結果は後でファイルを見る)'
+    menu WAIT "Wait" "$WAIT" $'1\tWait and show the review' $'0\tSubmit and exit (read the result file later)'
   fi
 
   # 同じ内容を引数で指定するコマンド(次回からそのまま使える)
@@ -184,73 +195,177 @@ interactive() {
   (( POST )) && cmd+=" --post"
   (( WAIT )) || cmd+=" --no-wait"
   cmd+=" $REPO $PR"
-  echo >&2; echo "同じ内容のコマンド: $cmd" >&2
-  menu sel "実行しますか" yes $'yes\t実行する' $'no\t中止する'
-  [ "$sel" = yes ] || { echo "中止しました" >&2; exit 0; }
+  echo >&2; echo "Equivalent command: $cmd" >&2
+  menu sel "Run it?" yes $'yes\tRun' $'no\tCancel'
+  [ "$sel" = yes ] || { echo "Cancelled." >&2; exit 0; }
 }
 (( INTERACTIVE )) && interactive
 
-(( POST && !WAIT )) && die "--post と --no-wait は同時に使えません"
+(( POST && !WAIT )) && die "--post and --no-wait cannot be used together"
 . "$ROOT/jobs/qsub_common.sh"
 
 RUN="$ROOT/runs/${REPO//\//_}/pr${PR}-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$RUN"
 gh pr view "$PR" -R "$REPO" --json number,title,body,author,baseRefName,headRefName,headRefOid,files,additions,deletions \
-  > "$RUN/pr.json" || { rm -rf "$RUN"; die "PR を取得できません: $REPO#$PR"; }
+  > "$RUN/pr.json" || { rm -rf "$RUN"; die "cannot fetch pull request $REPO#$PR"; }
 gh pr diff "$PR" -R "$REPO" > "$RUN/pr.diff"
 TITLE=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["title"])' "$RUN/pr.json")
 CHARS=$(wc -c < "$RUN/pr.diff")
-echo "PR: $REPO#$PR $TITLE(差分 $(wc -l < "$RUN/pr.diff") 行)" >&2
-(( CHARS > 160000 )) && echo "注意: 差分が約 16 万文字を超えるので、後ろのファイルはレビューされません" >&2
+echo "${BOLD}$REPO#$PR${RESET} $TITLE ${DIM}($(wc -l < "$RUN/pr.diff") diff lines)${RESET}" >&2
+(( CHARS > 160000 )) && echo "${RED}Note:${RESET} the diff exceeds ~160k characters; files near the end will not be reviewed" >&2
 
-JOB=$(qsub -o "$RUN/job.log" "${QSUB_ARGS[@]}" -v "$QSUB_VARS,RUN_DIR=$RUN,MODEL=$MODEL,ROOT=$ROOT" \
-  "$ROOT/jobs/review.pbs")
-echo "ジョブ: $JOB(キュー $QUEUE、GPU ${NGPUS} 枚、モデル $MODEL)" >&2
-echo "出力先: $RUN" >&2
+JOB=$(qsub -o "$RUN/job.log" "${QSUB_ARGS[@]}" \
+  -v "$QSUB_VARS,RUN_DIR=$RUN,MODEL=$MODEL,ROOT=$ROOT" "$ROOT/jobs/review.pbs")
+echo "${DIM}Job ${JOB%%.*} on $QUEUE (${NGPUS} GPU), model $MODEL${RESET}" >&2
+echo "${DIM}Output: $RUN${RESET}" >&2
 if (( !WAIT )); then
-  echo "結果: $RUN/review.md(qstat $JOB で状態確認)" >&2
+  echo "Result will be written to $RUN/review.md (check with: qstat $JOB)" >&2
   exit 0
 fi
 
-# 待っている間に Ctrl-C されたら、ジョブも取り消す
-trap 'echo; echo "中断したのでジョブ $JOB を取り消します" >&2; qdel "$JOB" 2>/dev/null; exit 130' INT TERM
-START=$(date +%s) LAST=
-while STATE=$(qstat -f "$JOB" 2>/dev/null | awk '/job_state =/ {print $3}'); [ -n "$STATE" ]; do
-  case $STATE in
-    Q) MSG="順番待ち" ;; R) MSG="実行中" ;; E) MSG="終了処理中" ;;
-    H) qdel "$JOB" 2>/dev/null
-       die "ジョブが保留(H)になりました。ノードの不調かもしれません。-H でノードを変えて試してください" ;;
-    *) MSG="状態 $STATE" ;;
-  esac
-  [ -f "$RUN/progress" ] && MSG="$MSG: $(tail -1 "$RUN/progress")"
-  if [ "$MSG" != "$LAST" ]; then
-    printf '[%3d 分] %s\n' $(( ($(date +%s) - START) / 60 )) "$MSG" >&2
-    LAST=$MSG
+# ---- ジョブの待機と、生成途中の出力の表示 ------------------------------------
+# ジョブは stream.txt に生成途中の出力を書き足し、stream.txt.stat に段階とトークン数を書く。
+# /work は計算ノードと共有なので、窓口サーバからこれを読んで表示できる。
+# 端末では、確定した行を上に流し、一番下に Claude Code 風の状態表示の行を出す。
+STREAM=$RUN/stream.txt
+TTY=0; [ -t 2 ] && TTY=1
+VERBS=(Simmering Pondering Brewing Percolating Cogitating Mulling Ruminating Noodling
+       Deliberating Marinating Contemplating Musing Churning Stewing Puzzling Scheming)
+GLYPHS=('·' '✢' '✳' '✶' '✻' '✽' '✻' '✶' '✳' '✢')
+VERB=${VERBS[RANDOM % ${#VERBS[@]}]}
+OFF=0 PARTIAL= SECTION= PHASE="queued" LASTPHASE= TOKENS=0 TICK=0
+START=$(date +%s) LAST_QSTAT=0 STATE=Q
+
+fmt_time() { local s=$1; (( s >= 60 )) && printf '%dm %ds' $((s / 60)) $((s % 60)) || printf '%ds' "$s"; }
+fmt_tokens() { local n=$1; (( n >= 1000 )) && printf '%d.%dk' $((n / 1000)) $((n % 1000 / 100)) || printf '%d' "$n"; }
+
+# 状態表示の行を消す(端末のときだけ)
+clear_status() { (( TTY )) && printf '\r\e[K' >&2 || true; }
+
+# 確定した行を表示する。=== 見出し === で、考える過程(薄い色)か本文かを切り替える。
+emit_lines() {
+  local line
+  while IFS= read -r line; do
+    case $line in
+      "=== Thinking ===")  SECTION=thinking; printf '%s\n' "${DIM}${CYAN}── thinking ──${RESET}" >&2 ;;
+      "=== Review ===")    SECTION=review;   printf '%s\n' "${CYAN}── review ──${RESET}" >&2 ;;
+      "=== "*" ===")       line=${line#=== }; printf '%s\n' "${DIM}${line% ===}${RESET}" >&2 ;;
+      *) if [ "$SECTION" = thinking ]; then printf '%s\n' "${DIM}${line}${RESET}" >&2
+         else printf '%s\n' "$line" >&2; fi ;;
+    esac
+  done <<< "$1"
+}
+
+# stream.txt の新しく増えた分を読み、改行で終わる行だけを表示する(途中の行は状態表示の行に出す)
+pump_stream() {
+  (( QUIET )) && return 0
+  [ -f "$STREAM" ] || return 0
+  local size data
+  size=$(stat -c %s "$STREAM" 2>/dev/null || echo 0)
+  (( size > OFF )) || return 0
+  data=$(tail -c +$((OFF + 1)) "$STREAM" | head -c $((size - OFF)); printf x)
+  data=${data%x}
+  OFF=$size
+  data=$PARTIAL$data
+  if [[ $data == *$'\n'* ]]; then
+    clear_status
+    emit_lines "${data%$'\n'*}"
+    PARTIAL=${data##*$'\n'}
+  else
+    PARTIAL=$data
   fi
-  sleep 10
+}
+
+# 段階(phase)を決める: キュー待ち → ジョブ側の進み具合 → 生成の段階
+update_phase() {
+  local stat p n
+  case $STATE in
+    Q) PHASE="queued" ;;
+    E) PHASE="finishing" ;;
+    R) PHASE="starting"
+       [ -f "$RUN/progress" ] && PHASE=$(tail -1 "$RUN/progress" | tr 'A-Z' 'a-z')
+       if [ -f "$STREAM.stat" ] && read -r p n < "$STREAM.stat" 2>/dev/null; then
+         TOKENS=${n:-0}
+         case $p in reading) PHASE="reading diff" ;; thinking) PHASE="thinking" ;;
+                    writing) PHASE="writing review" ;; done) PHASE="done" ;; esac
+       fi ;;
+  esac
+  if [ "$PHASE" != "$LASTPHASE" ]; then
+    # 段階が変わったら言葉も変える。端末でないときは、段階の変化を 1 行ずつ記録する
+    VERB=${VERBS[RANDOM % ${#VERBS[@]}]}
+    (( TTY )) || echo "[$(fmt_time $(( $(date +%s) - START )))] $PHASE" >&2
+    LASTPHASE=$PHASE
+  fi
+}
+
+# 一番下の状態表示の行: ✻ Simmering… (1m 12s · 3.4k tokens · thinking)  途中の行…
+draw_status() {
+  (( TTY )) || return 0
+  local el ptail info
+  el=$(fmt_time $(( $(date +%s) - START )))
+  info="$el"
+  (( TOKENS > 0 )) && info+=" · $(fmt_tokens "$TOKENS") tokens"
+  info+=" · $PHASE"
+  ptail=${PARTIAL: -60}
+  # 折り返しを止めて描く(長い行は画面の端で切れる)
+  printf '\e[?7l\r\e[K%s %s… %s%s' "${CYAN}${GLYPHS[TICK % ${#GLYPHS[@]}]}${RESET}" "${BOLD}${VERB}${RESET}" \
+    "${DIM}(${info})" "${ptail:+  $ptail}${RESET}" >&2
+  printf '\e[?7h' >&2
+  TICK=$(( TICK + 1 ))
+}
+
+finish_status() { clear_status; (( TTY )) && printf '\e[?25h' >&2 || true; }
+
+# 待っている間に Ctrl-C されたら、ジョブも取り消す
+trap 'finish_status; echo; echo "Interrupted; cancelling job ${JOB%%.*}" >&2; qdel "$JOB" 2>/dev/null; exit 130' INT TERM
+(( TTY )) && printf '\e[?25l' >&2            # 状態表示の間はカーソルを隠す
+while :; do
+  now=$(date +%s)
+  if (( now - LAST_QSTAT >= 5 )); then       # キューの状態は 5 秒ごとに確認する
+    STATE=$(qstat -f "$JOB" 2>/dev/null | awk '/job_state =/ {print $3}') || true
+    LAST_QSTAT=$now
+    [ -z "$STATE" ] && break
+    if [ "$STATE" = H ]; then
+      qdel "$JOB" 2>/dev/null; finish_status
+      die "the job was held (H); the node may be unhealthy. Try another node with -H"
+    fi
+  fi
+  update_phase
+  pump_stream
+  draw_status
+  sleep 0.12
 done
+pump_stream                                  # 最後に残った分を出す
+[ -n "$PARTIAL" ] && { clear_status; emit_lines "$PARTIAL"; PARTIAL=; }
+finish_status
 trap - INT TERM
+STREAMED=0; (( !QUIET )) && [ -f "$STREAM" ] && STREAMED=1
 
 # qstat から消えても、ジョブのログが書き出されるまで少し待つ
 for _ in $(seq 30); do [ -f "$RUN/job.log" ] && break; sleep 2; done
 if [ ! -s "$RUN/review.md" ]; then
-  echo "レビューに失敗しました。ジョブのログの最後:" >&2
+  echo "${RED}Review failed.${RESET} Last lines of the job log:" >&2
   tail -15 "$RUN/job.log" >&2 2>/dev/null || true
   exit 1
 fi
 
 echo >&2
-cat "$RUN/review.md"
-[ -n "$OUTPUT" ] && cp "$RUN/review.md" "$OUTPUT" && echo "保存: $OUTPUT" >&2
+if (( STREAMED )) && [ -t 1 ]; then
+  # 本文はもう画面に流れたので、繰り返さない(リダイレクトしているときは本文を出力する)
+  echo "${DIM}Saved: $RUN/review.md${RESET}" >&2
+else
+  cat "$RUN/review.md"
+fi
+[ -n "$OUTPUT" ] && cp "$RUN/review.md" "$OUTPUT" && echo "Saved: $OUTPUT" >&2
 
 if (( POST )); then
-  read -r -p "このレビューを $REPO#$PR にコメントとして投稿しますか? [y/N] " ans < /dev/tty
+  read -r -p "Post this review as a comment on $REPO#$PR? [y/N] " ans < /dev/tty
   if [[ $ans == [yY]* ]]; then
     SHA=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["headRefOid"])' "$RUN/pr.json")
     { echo "> 🤖 ローカルLLM(\`$MODEL\`)による自動レビューです(コミット ${SHA:0:7})。誤りを含むことがあるので、参考情報として扱ってください。"
       echo; cat "$RUN/review.md"; } > "$RUN/comment.md"
     gh pr comment "$PR" -R "$REPO" --body-file "$RUN/comment.md"
   else
-    echo "投稿しませんでした" >&2
+    echo "Not posted." >&2
   fi
 fi
