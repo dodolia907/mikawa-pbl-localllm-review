@@ -6,8 +6,7 @@
 #PBS -j oe
 #PBS -v SINGULARITY_IMAGE=/common/Singularity_sif/prg_env_intel_2025.02.sif
 # 同じ PR を複数のモデルでレビューして比べる。
-# 使い方(窓口サーバ。RUN_DIR は submit_review.sh が作ったディレクトリ):
-#   qsub -o <ログ> -v "RUN_DIR=<dir>,ROOT=$PWD,MODELS=qwen3.8:27b-q8_0 flint:40b" jobs/compare.pbs
+# submit_compare.sh から RUN_DIR, ROOT, MODELS(空白区切り)を受け取る。
 set -euo pipefail
 ulimit -c 0
 
