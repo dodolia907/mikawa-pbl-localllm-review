@@ -431,15 +431,15 @@ update_phase() {
   fi
 }
 
-# 一番下の状態表示の行: Simmering… (1m 12s · 3.4k tokens · thinking)  途中の行…
+# 一番下の状態表示の行: Simmering… (1m 12s · ↓ 3.4k tokens · thinking · ctrl+c to cancel)  途中の行…
 draw_status() {
   (( TTY )) || return 0
   local now el tk info ptail verb
   printf -v now '%(%s)T' -1
   fmt_time el $(( now - START ))
   info=$el
-  if (( TOKENS > 0 )); then fmt_tokens tk "$TOKENS"; info+=" · $tk tokens"; fi
-  info+=" · $PHASE"
+  if (( TOKENS > 0 )); then fmt_tokens tk "$TOKENS"; info+=" · ↓ $tk tokens"; fi
+  info+=" · $PHASE · ctrl+c to cancel"
   ptail=${PARTIAL: -60}
   # 折り返しを止めて 1 回の書き込みで描く(長い行は画面の端で切れる)
   shimmer verb "$VERB"

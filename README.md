@@ -113,10 +113,11 @@ Queue / GPU  (↑↓ / j k to move, Enter to select, q to cancel)
 ```
 ── thinking ──
 We need to review the CI workflow changes. The mac and windows jobs only run on ...
-✻ Deliberating… (2m 41s · 3.4k tokens · thinking)  so a push to a branch never builds
+Deliberating… (2m 41s · ↓ 3.4k tokens · thinking · ctrl+c to cancel)  so a push to a branch never builds
 ```
 
 - 状態表示の行は、経過時間・生成したトークン数・段階(queued → starting ollama → loading model onto gpu → reading diff → thinking → writing review)を示す。末尾は生成途中の行
+- 先頭の言葉(Deliberating など)の上を明るいシアンの帯が流れる。言葉は段階が変わるたびに変わる
 - 本文はすでに画面に流れているので、終わった後は保存先だけを表示する。標準出力をリダイレクトしたときは、本文を出力する
 - `--quiet` を付けると、生成途中の出力を流さず、状態表示だけにする
 - 端末でないとき(ログに保存するときなど)は、アニメーションの代わりに段階の変化を 1 行ずつ出す
