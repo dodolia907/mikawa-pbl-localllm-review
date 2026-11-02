@@ -169,10 +169,10 @@ PR #3(CI の変更、差分 99 行)で、指摘を差分と照らし合わせて
 | **flint:40b**(既定) | **5** | **0** | 274 秒 |
 | ornith-1.5:35b | 5 | 1 | 412 秒 |
 
-PR 1 件だけでの比較なので、別の PR でも比べるとよい。同じ PR を複数のモデルで比べるには:
+PR 1 件だけでの比較なので、別の PR でも比べるとよい。同じ PR を別のモデルでレビューするには `-m` で指定する:
 
 ```bash
-./submit_compare.sh runs/TechnoTUT_dmxctl/pr3-<日時> flint:40b qwen3.8:27b-q8_0
+./review-pr -m qwen3.8:27b-q8_0 TechnoTUT/dmxctl 3
 ```
 
 ## 制約と注意
@@ -193,5 +193,3 @@ PR 1 件だけでの比較なので、別の PR でも比べるとよい。同�
 | `jobs/review.pbs` | レビューのジョブ |
 | `jobs/ollama_env.sh` | Ollama の起動、モデルの取得、GPU への読み込みの確認 |
 | `jobs/qsub_common.sh` | キューに応じた qsub の引数(コンテナ・GPU 数・ノード) |
-| `submit_compare.sh` / `jobs/compare.pbs` | 同じ PR を複数のモデルでレビューして比べる |
-| `jobs/probe.pbs` / `jobs/probe-amd.pbs` | GPU とネットワークの疎通確認(iEduq / Eduq) |
