@@ -5,13 +5,16 @@
 #PBS -l walltime=01:00:00
 #PBS -j oe
 #PBS -v SINGULARITY_IMAGE=/common/Singularity_sif/prg_env_intel_2025.02.sif
-# 単発レビュー。submit_review.sh から RUN_DIR, MODEL, ROOT を受け取る。
+# PR を 1 件レビューする。review-pr から RUN_DIR, MODEL, ROOT を受け取る(キュー等も review-pr が指定する)。
 set -euo pipefail
 ulimit -c 0
+
+# PBS の -o はジョブ終了時にしか書き出されないので、review-pr が進み具合を表示できるよう別にも書く
+exec > >(tee -a "$RUN_DIR/progress") 2>&1
 
 OLLAMA_LOG=$RUN_DIR/ollama.log
 . "$ROOT/jobs/ollama_env.sh"
 
+echo "レビュー中(数分かかる)"
 python3 "$ROOT/review.py" --host "$OLLAMA_URL" --model "$MODEL" \
   --pr-json "$RUN_DIR/pr.json" --diff "$RUN_DIR/pr.diff" --out "$RUN_DIR/review.md"
-echo "done: $RUN_DIR/review.md"

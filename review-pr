@@ -1,0 +1,214 @@
+#!/bin/bash
+# ローカル LLM で GitHub の PR をレビューする CLI。窓口サーバ(ydev)で実行する。
+# PR の情報と差分を gh で取得し、GPU ノードにジョブを投入し、終わるのを待ってレビューを表示する。
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+使い方: review-pr [オプション] <owner/repo> <PR番号>
+        review-pr [オプション] <PR の URL>
+        review-pr                       (引数なし: 対話モードで順に選ぶ)
+
+オプション:
+  -i, --interactive    対話モードで選ぶ(引数やオプションで指定した値が既定値になる)
+  -q, --queue QUEUE    使うキュー: iEduq(NVIDIA A100、既定)か Eduq(AMD MI210)
+  -g, --gpus N         使う GPU 数(iEduq は 1、Eduq は 1〜2。既定 1)
+  -H, --host NODE      ノードを固定する(例 yind01)
+  -m, --model MODEL    Ollama のモデル(既定 flint:40b)
+  -o, --output FILE    レビューを FILE にも保存する
+      --post           レビューを PR にコメントとして投稿する(投稿前に確認する)
+      --no-wait        ジョブを投入したら待たずに終わる
+  -h, --help           この説明を表示する
+
+例:
+  review-pr TechnoTUT/dmxctl 3
+  review-pr https://github.com/TechnoTUT/dmxctl/pull/3
+  review-pr -q Eduq -m qwen3.8:27b-q8_0 TechnoTUT/dmxctl 3
+EOF
+}
+
+die() { echo "review-pr: $*" >&2; exit 1; }
+
+ROOT=$(cd "$(dirname "$(realpath "$0")")" && pwd)
+MODEL=flint:40b
+OUTPUT= POST=0 WAIT=1 INTERACTIVE=0
+REPO= PR=
+ARGS=()
+while (( $# )); do
+  case $1 in
+    -i|--interactive) INTERACTIVE=1; shift ;;
+    -q|--queue)  QUEUE=${2:?}; shift 2 ;;
+    -g|--gpus)   NGPUS=${2:?}; shift 2 ;;
+    -H|--host)   HOST=${2:?}; shift 2 ;;
+    -m|--model)  MODEL=${2:?}; shift 2 ;;
+    -o|--output) OUTPUT=${2:?}; shift 2 ;;
+    --post)      POST=1; shift ;;
+    --no-wait)   WAIT=0; shift ;;
+    -h|--help)   usage; exit 0 ;;
+    -*)          usage >&2; die "不明なオプションです: $1" ;;
+    *)           ARGS+=("$1"); shift ;;
+  esac
+done
+
+if (( ${#ARGS[@]} == 1 )) && [[ ${ARGS[0]} =~ github\.com/([^/]+/[^/]+)/pull/([0-9]+) ]]; then
+  REPO=${BASH_REMATCH[1]} PR=${BASH_REMATCH[2]}
+elif (( ${#ARGS[@]} == 2 )) && [[ ${ARGS[0]} == */* && ${ARGS[1]} =~ ^[0-9]+$ ]]; then
+  REPO=${ARGS[0]} PR=${ARGS[1]}
+elif (( ${#ARGS[@]} == 1 )) && [[ ${ARGS[0]} == */* ]] && (( INTERACTIVE )); then
+  REPO=${ARGS[0]}                     # -i でリポジトリだけ指定し、PR は対話で選ぶ
+elif (( ${#ARGS[@]} == 0 )) && [ -t 0 ]; then
+  INTERACTIVE=1                       # 引数なしで端末から実行されたら対話モード
+else
+  usage >&2; exit 1
+fi
+command -v gh > /dev/null || die "gh が見つかりません"
+
+# ---- 対話モード ----------------------------------------------------------
+# ask <変数名> <質問> [既定値]: 入力を変数に入れる。空欄なら既定値。
+ask() {
+  # 呼び出し側の変数名と重ならないよう、ローカル変数は _ask_ で始める
+  local _ask_var=$1 _ask_q=$2 _ask_def=${3:-} _ask_in
+  read -r -e -p "$_ask_q${_ask_def:+ [$_ask_def]}: " _ask_in < /dev/tty || { echo; echo "中止しました" >&2; exit 1; }
+  printf -v "$_ask_var" '%s' "${_ask_in:-$_ask_def}"
+}
+# choose <変数名> <質問> <既定値> <選択肢...>: 番号か値そのもので選ぶ(一覧にない値も入力できる)
+choose() {
+  local _ch_var=$1 _ch_q=$2 _ch_def=$3 _ch_ans _ch_i; shift 3
+  local _ch_opts=("$@")
+  for _ch_i in "${!_ch_opts[@]}"; do printf '  %d) %s\n' $((_ch_i + 1)) "${_ch_opts[_ch_i]}" >&2; done
+  ask _ch_ans "$_ch_q" "$_ch_def"
+  if [[ $_ch_ans =~ ^[0-9]+$ ]] && (( _ch_ans >= 1 && _ch_ans <= ${#_ch_opts[@]} )); then
+    _ch_ans=${_ch_opts[_ch_ans - 1]%% *}      # 「値 説明」の形の選択肢は、値だけを取る
+  fi
+  printf -v "$_ch_var" '%s' "$_ch_ans"
+}
+
+interactive() {
+  local list models=() m q
+  echo "== review-pr: 対話モード(空欄で [ ] 内の既定値、Ctrl-C で中止)" >&2
+
+  until [[ $REPO =~ ^[^/[:space:]]+/[^/[:space:]]+$ ]]; do
+    [ -n "$REPO" ] && echo "  owner/repo の形で入力してください" >&2
+    ask REPO "リポジトリ(owner/repo)"
+  done
+
+  if [ -z "$PR" ]; then
+    echo "オープンな PR:" >&2
+    list=$(gh pr list -R "$REPO" --state open --limit 30 \
+      --json number,title,author,isDraft,additions,deletions \
+      --template '{{range .}}{{printf "  #%-5v" .number}} {{.title}}  ({{.author.login}}, +{{.additions}}/-{{.deletions}}{{if .isDraft}}, draft{{end}}){{"\n"}}{{end}}') \
+      || die "リポジトリを参照できません: $REPO"
+    if [ -n "$list" ]; then echo "$list" >&2; else echo "  (なし。マージ済みなどの PR も番号で指定できる)" >&2; fi
+    local first; first=$(sed -n '1s/^ *#\([0-9]*\).*/\1/p' <<< "$list")
+  fi
+  until [[ $PR =~ ^[0-9]+$ ]]; do ask PR "PR 番号" "${first:-}"; PR=${PR#\#}; done
+
+  choose QUEUE "キュー" "${QUEUE:-iEduq}" \
+    "iEduq NVIDIA A100 80GB × 1(yind00/01)" "Eduq  AMD MI210 64GB × 2(ysnd00)"
+  if [ "$QUEUE" = Eduq ]; then
+    echo "  (1 枚に載るモデルは 2 枚にしても速くならない。2 枚は 64GB を超える大きなモデル向け)" >&2
+    ask NGPUS "GPU 数(1〜2)" "${NGPUS:-1}"
+  fi
+
+  # 取得済みのモデル(/work/$USER/llm/models の目録)を選択肢にする
+  while IFS= read -r m; do
+    m=${m#*/manifests/*/}; m=${m#library/}; models+=("${m%/*}:${m##*/}")
+  done < <(find "${LLM_HOME:-/work/$USER/llm}/models/manifests" -mindepth 3 -type f 2>/dev/null | sort)
+  echo "モデル(取得済み。ほかのモデル名も入力できる。未取得なら初回に取得する):" >&2
+  choose MODEL "モデル" "$MODEL" "${models[@]}"
+
+  local nodes; [ "$QUEUE" = Eduq ] && nodes="ysnd00 ysnd01" || nodes="yind00 yind01"
+  while :; do
+    ask HOST "ノードを固定($nodes。空欄で自動)" "${HOST:-}"
+    [ -z "$HOST" ] || [[ " $nodes " == *" $HOST "* ]] && break
+    echo "  $QUEUE のノードは $nodes です" >&2; HOST=
+  done
+  q=n; (( POST )) && q=y
+  ask q "レビューを PR にコメントとして投稿する?(投稿前にもう一度確認する)(y/n)" "$q"
+  [[ $q == [yY]* ]] && POST=1 || POST=0
+  q=y; (( WAIT )) || q=n
+  if (( !POST )); then
+    ask q "終わるまで待って結果を表示する?(y/n)" "$q"
+    [[ $q == [yY]* ]] && WAIT=1 || WAIT=0
+  fi
+
+  # 同じ内容を引数で指定するコマンド(次回からそのまま使える)
+  local cmd="review-pr"
+  [ "$QUEUE" != iEduq ] && cmd+=" -q $QUEUE"
+  [ "${NGPUS:-1}" != 1 ] && cmd+=" -g $NGPUS"
+  [ -n "${HOST:-}" ] && cmd+=" -H $HOST"
+  [ "$MODEL" != flint:40b ] && cmd+=" -m $MODEL"
+  [ -n "$OUTPUT" ] && cmd+=" -o $OUTPUT"
+  (( POST )) && cmd+=" --post"
+  (( WAIT )) || cmd+=" --no-wait"
+  cmd+=" $REPO $PR"
+  echo >&2; echo "実行するコマンド: $cmd" >&2
+  ask q "実行しますか?(y/n)" y
+  [[ $q == [yY]* ]] || { echo "中止しました" >&2; exit 0; }
+}
+(( INTERACTIVE )) && interactive
+
+(( POST && !WAIT )) && die "--post と --no-wait は同時に使えません"
+. "$ROOT/jobs/qsub_common.sh"
+
+RUN="$ROOT/runs/${REPO//\//_}/pr${PR}-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$RUN"
+gh pr view "$PR" -R "$REPO" --json number,title,body,author,baseRefName,headRefName,headRefOid,files,additions,deletions \
+  > "$RUN/pr.json" || { rm -rf "$RUN"; die "PR を取得できません: $REPO#$PR"; }
+gh pr diff "$PR" -R "$REPO" > "$RUN/pr.diff"
+TITLE=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["title"])' "$RUN/pr.json")
+CHARS=$(wc -c < "$RUN/pr.diff")
+echo "PR: $REPO#$PR $TITLE(差分 $(wc -l < "$RUN/pr.diff") 行)" >&2
+(( CHARS > 160000 )) && echo "注意: 差分が約 16 万文字を超えるので、後ろのファイルはレビューされません" >&2
+
+JOB=$(qsub -o "$RUN/job.log" "${QSUB_ARGS[@]}" -v "$QSUB_VARS,RUN_DIR=$RUN,MODEL=$MODEL,ROOT=$ROOT" \
+  "$ROOT/jobs/review.pbs")
+echo "ジョブ: $JOB(キュー $QUEUE、GPU ${NGPUS} 枚、モデル $MODEL)" >&2
+echo "出力先: $RUN" >&2
+if (( !WAIT )); then
+  echo "結果: $RUN/review.md(qstat $JOB で状態確認)" >&2
+  exit 0
+fi
+
+# 待っている間に Ctrl-C されたら、ジョブも取り消す
+trap 'echo; echo "中断したのでジョブ $JOB を取り消します" >&2; qdel "$JOB" 2>/dev/null; exit 130' INT TERM
+START=$(date +%s) LAST=
+while STATE=$(qstat -f "$JOB" 2>/dev/null | awk '/job_state =/ {print $3}'); [ -n "$STATE" ]; do
+  case $STATE in
+    Q) MSG="順番待ち" ;; R) MSG="実行中" ;; E) MSG="終了処理中" ;;
+    H) qdel "$JOB" 2>/dev/null
+       die "ジョブが保留(H)になりました。ノードの不調かもしれません。-H でノードを変えて試してください" ;;
+    *) MSG="状態 $STATE" ;;
+  esac
+  [ -f "$RUN/progress" ] && MSG="$MSG: $(tail -1 "$RUN/progress")"
+  if [ "$MSG" != "$LAST" ]; then
+    printf '[%3d 分] %s\n' $(( ($(date +%s) - START) / 60 )) "$MSG" >&2
+    LAST=$MSG
+  fi
+  sleep 10
+done
+trap - INT TERM
+
+# qstat から消えても、ジョブのログが書き出されるまで少し待つ
+for _ in $(seq 30); do [ -f "$RUN/job.log" ] && break; sleep 2; done
+if [ ! -s "$RUN/review.md" ]; then
+  echo "レビューに失敗しました。ジョブのログの最後:" >&2
+  tail -15 "$RUN/job.log" >&2 2>/dev/null || true
+  exit 1
+fi
+
+echo >&2
+cat "$RUN/review.md"
+[ -n "$OUTPUT" ] && cp "$RUN/review.md" "$OUTPUT" && echo "保存: $OUTPUT" >&2
+
+if (( POST )); then
+  read -r -p "このレビューを $REPO#$PR にコメントとして投稿しますか? [y/N] " ans < /dev/tty
+  if [[ $ans == [yY]* ]]; then
+    SHA=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["headRefOid"])' "$RUN/pr.json")
+    { echo "> 🤖 ローカルLLM(\`$MODEL\`)による自動レビューです(コミット ${SHA:0:7})。誤りを含むことがあるので、参考情報として扱ってください。"
+      echo; cat "$RUN/review.md"; } > "$RUN/comment.md"
+    gh pr comment "$PR" -R "$REPO" --body-file "$RUN/comment.md"
+  else
+    echo "投稿しませんでした" >&2
+  fi
+fi

@@ -1,8 +1,7 @@
 """Ollama 上のローカルLLMに PR の差分を渡し、レビューを Markdown で返す。標準ライブラリのみ使用。
 
-単発で使う場合(submit_review.sh から呼ばれる):
+ジョブ(jobs/review.pbs)の中で、起動済みの Ollama に対して実行される:
   python3 review.py --host URL --model M --pr-json pr.json --diff pr.diff --out review.md
-watch.py からは review_pr() を import して使う。
 """
 import argparse
 import json
