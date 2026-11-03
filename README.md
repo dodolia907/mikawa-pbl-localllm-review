@@ -25,6 +25,7 @@ review-pr(窓口サーバ ydev)
 | ファイル | 中身 |
 |---|---|
 | `review.md` | レビュー |
+| `src/` / `mcp.json` | `--mcp` のとき: PR 適用後のソース / MCP サーバの設定 |
 | `pr.json` / `pr.diff` | PR の情報と差分 |
 | `progress` | ジョブの進み具合 |
 | `stream.txt` / `stream.txt.stat` | 生成途中の出力 / 段階とトークン数 |
@@ -64,6 +65,8 @@ review-pr                       (引数なし: 対話モードで順に選ぶ)
   -H, --host NODE      ノードを固定する(例 yind01)
   -m, --model MODEL    Ollama のモデル(既定 flint:40b)
   -o, --output FILE    レビューを FILE にも保存する
+      --mcp            モデルが MCP のツールでリポジトリを読み、検査し、資料を引けるようにする(後述)
+      --scope DIR      --mcp のツールが読めるのを、リポジトリの DIR の中だけにする(例 teams/invtechno)
       --post           レビューを PR にコメントとして投稿する(投稿前に確認する)
       --no-wait        ジョブを投入したら待たずに終わる
       --quiet          生成途中の出力を流さず、状態表示だけにする
@@ -162,6 +165,90 @@ iEduq で約 1 分 45 秒(Eduq で約 35 秒)かかり、さらにキューの�
 - サーバも 1 ジョブとして数えるので、同じキューでは、サーバを動かしている間は別のジョブは順番待ちになる
   (`--new-job` は、もう一方のキューで使うとよい)
 
+## MCP のツールを使う(--mcp)
+
+`--mcp` を付けると、モデルがレビュー中に MCP のツールを呼べるようになる。差分だけでは判断できないこと
+(変更された関数の呼び出し元、型や定数の定義、設定ファイルなど)をリポジトリのファイルを読んで確かめたり、
+Python・HTML・Django テンプレートを検査したり、使っている版の公式資料で API の使い方を確かめたりできる。
+
+| サーバ | ツール | 中身 |
+|---|---|---|
+| `repo` | `read_file` / `search` / `list_files` | PR 適用後のリポジトリを読む(行番号付き、1 回 400 行まで) |
+| `check` | `check_python` | ruff で構文エラー・未定義の名前・使っていない import・bugbear の規則を調べる(書式の規則は使わない) |
+| | `check_template` | HTML と Django テンプレートの、開きタグと閉じタグ・`{% if %}`〜`{% endif %}` などの対応を調べる |
+| `docs` | `search_docs` / `read_doc` | Python・Django・HTML(MDN)の公式資料を検索して読む |
+
+`check` は PR のコードを実行しない(ファイルを読んで調べるだけ)。`manage.py check` やテストのように
+コードを動かす検査は、計算ノードで学生のコードが動き、共有の `/home` にある gh の認証情報などに
+触れられてしまうので入れていない。
+
+資料は窓口サーバで 1 回取得しておく(約 25MB、`/work/$USER/llm/docs`)。取得していなければ `docs` は使わない:
+
+```bash
+./fetch-docs                               # Python 3.14、Django 6.1.2、HTML(MDN)
+./fetch-docs --python 3.13 --django 5.2.8  # 別の版を足す
+```
+
+使う版は、レビューするリポジトリの `pyproject.toml`(`requires-python`、`django==`)や `requirements*.txt` から選ぶ
+(合う版がなければ取得済みの最も新しい版)。Django を使っていないリポジトリでは Django の資料を渡さない。
+
+```bash
+./review-pr --mcp TechnoTUT/dmxctl 3
+```
+
+```
+review-pr(窓口サーバ)
+  ├ gh api で PR の head のソース(tarball)を取得 → runs/.../src/
+  ├ MCP サーバの設定を runs/.../mcp.json に書く
+  └ ジョブ(GPU ノード)
+       review.py(uv の Python 3.12 + mcp SDK)
+         ├ MCP サーバ(repo / check / docs)を起動(stdio)し、ツールの一覧を Ollama の tools に渡す
+         └ モデルがツールを呼ぶ → MCP サーバで実行 → 結果を返す、を答えが出るまで繰り返す
+```
+
+- どのツールも読み取り専用で、`src/`(と資料)の外は読めない
+- 1 パートあたり最大 12 回まで呼べる(結果の末尾に残りの回数を添える)。超えたらツールなしで書かせる。
+  呼んだツールは画面に薄い色で 1 行ずつ出る
+- 変更されたファイルに共通するフォルダ(例 `teams/invtechno`)をプロンプトで伝え、ほかのフォルダを読み回らないよう指示する。
+  モノレポでは、制限しないとチームの資料を片端から読み、考える過程も長くなる
+  (pbl-app-2026 #49 では、Markdown 2 ファイルの PR で 32 回呼び、考える過程が 1.9 万トークンを超えた)
+- ソースは窓口サーバで取得するので、gh のトークンは計算ノードに渡さない
+- 公式の mcp SDK(Python 3.10 以上)を使うため、uv で Python 3.12 と `mcp==2.3.0`、`ruff==0.17.3` の環境を用意する
+  (`jobs/run_review.sh`)。窓口サーバで取得してキャッシュ(`~/.cache/uv`)に入れ、ジョブはネットワークを使わない
+- ツールの結果の分だけ入力が増え、時間もかかる(ジョブの時間上限はパートごとに 15 分延ばす)
+- ツール呼び出しに対応したモデルが必要(`flint:40b` は対応)
+
+### 読める範囲を制限する(--scope)
+
+モノレポで 1 チームだけを対象にするときは、`--scope` でツールが読めるフォルダを決める(`--mcp` も有効になる):
+
+```bash
+./review-pr --scope teams/invtechno https://github.com/mikawa-pbl/pbl-app-2026/pull/49
+./review-pr --scope teams/invtechno,teams/mint ...   # カンマで複数
+```
+
+- `repo` と `check` は、範囲の外のパスを拒否する(`..`、絶対パス、範囲の外を指すシンボリックリンクも)。
+  `path` を省略すると範囲のフォルダが対象になり、`teams` のような上のフォルダを指定すると、その中の範囲だけを調べる
+- プロンプトでも「対象はこの中だけ」と伝える
+- 共通の設定(`pbl_project/settings.py` など)も読めなくなる。それも見せたいときは `--scope` に加える
+- `docs`(公式資料)は対象外(リポジトリではないため)
+
+### ほかの MCP サーバを足す
+
+リポジトリ直下に `mcp.json` を置くと、そのサーバも使う。形は Claude Code の `.mcp.json` と同じ。
+サーバは計算ノードで起動される。文字列の中の `${PYTHON}`(mcp SDK 入りの Python)、`${ROOT}`、`${RUN_DIR}` は置き換えられる。
+
+```json
+{"mcpServers": {
+  "docs": {"command": "${PYTHON}", "args": ["/work/you/my_docs_server.py"]},
+  "wiki": {"type": "http", "url": "https://example.com/mcp"}
+}}
+```
+
+- HTTP のサーバは計算ノードから届く URL にする(ヘッダによる認証には対応していない)
+- uv はジョブの中では `--offline` で動くので、追加のサーバに必要なパッケージは事前に用意しておく
+- 追加のサーバのツールも「サーバ名__ツール名」でモデルに見せる。書き込みのできるツールは足さない
+
 ## モデルの選び方
 
 PR #3(CI の変更、差分 99 行)で、指摘を差分と照らし合わせて比べた結果(2026-11-03、iEduq):
@@ -195,7 +282,14 @@ PR 1 件だけでの比較なので、別の PR でも比べるとよい。同�
 | `jobs/server_common.sh` | サーバの一覧と生死の判定 |
 | `motd` | `review-pr` の起動時に表示するバナー(端末に出すときだけ) |
 | `jobs/ui.sh` | 色の設定と、対話用の入力・メニュー(`review-pr` と `review-server` で共通) |
-| `review.py` | Ollama にプロンプトを渡してレビューを得る(標準ライブラリのみ) |
+| `review.py` | Ollama にプロンプトを渡してレビューを得る(`--mcp-config` なしなら標準ライブラリのみ) |
+| `mcp_client.py` | MCP サーバにつなぎ、ツールを Ollama のツール呼び出しから使えるようにする |
+| `mcp_repo_server.py` | PR 適用後のリポジトリを読み取り専用で返す MCP サーバ |
+| `mcp_check_server.py` | Python(ruff)と HTML・Django テンプレートを静的に検査する MCP サーバ |
+| `mcp_docs_server.py` | Python・Django・HTML の公式資料を検索する MCP サーバ |
+| `mcp_scope.py` | `repo` と `check` が読める範囲(`--scope`)の判定 |
+| `fetch-docs` | `mcp_docs_server.py` が使う資料を取得する |
+| `jobs/run_review.sh` | review.py の実行(mcp.json があれば uv の環境で MCP を使う) |
 | `jobs/review.pbs` | レビューのジョブ |
 | `jobs/ollama_env.sh` | Ollama の起動、モデルの取得、GPU への読み込みの確認 |
 | `jobs/qsub_common.sh` | キューに応じた qsub の引数(コンテナ・GPU 数・ノード) |
