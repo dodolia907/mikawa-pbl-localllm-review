@@ -195,7 +195,7 @@ Python・HTML・Django テンプレートを検査したり、使っている版
 | `repo` | `read_file` / `search` / `list_files` | PR 適用後のリポジトリを読む(行番号付き、1 回 400 行まで) |
 | `check` | `check_python` | ruff で構文エラー・未定義の名前・使っていない import・bugbear の規則を調べる(書式の規則は使わない) |
 | | `check_template` | HTML と Django テンプレートの、開きタグと閉じタグ・`{% if %}`〜`{% endif %}` などの対応を調べる |
-| `docs` | `search_docs` / `read_doc` | Python・Django・HTML(MDN)の公式資料を検索して読む |
+| `docs` | `search_docs` / `read_doc` | Python・Django・HTML(MDN)の公式資料を検索して読む。検索は機能語(on・which など)を無視し、全部の語を含む節がなければ、含む語の多い順(珍しい語ほど重く)に出す。変更履歴(releases)より今の動作の説明を先に出す |
 
 モデルには、Django・Python・HTML の動作を根拠にする指摘(CSRF・Cookie、フィールドの引数、テンプレートタグなど)は
 記憶で書かず、`docs` で確かめて根拠の資料のパスを添えるよう指示している(確かめられなければ「要確認」)。

@@ -8,6 +8,7 @@
   mdn-html/      MDN の HTML の項目(Markdown)
 どの版を使うかは review-pr が、レビューするリポジトリの pyproject.toml などから選んで引数で渡す。
 """
+import math
 import os
 import re
 import sys
@@ -68,38 +69,61 @@ def load():
 INDEX = load()
 
 
+# 検索で無視する語。モデルは "Django CSRF cookie set on which response ..." のような文で検索することがあり、
+# 機能語まで「すべて含む」を求めると何も見つからなかった(pbl-app-2026 #49)
+STOPWORDS = {
+    "a", "an", "the", "on", "in", "at", "of", "to", "for", "from", "by", "with", "and", "or", "not", "no",
+    "is", "are", "be", "been", "was", "were", "do", "does", "did", "can", "could", "should", "would", "will",
+    "how", "what", "which", "when", "where", "why", "who", "whether", "if", "then", "than", "that", "this",
+    "these", "those", "it", "its", "as", "into", "about", "via", "vs", "use", "used", "using",
+    "docs", "documentation", "python", "django", "html", "mdn",
+}
+
+
 @mcp.tool()
 def search_docs(query: str, source: str = "all") -> str:
     """Search the official documentation of Python, Django and HTML (MDN) for the versions this project uses.
 
-    query: keywords, e.g. "ForeignKey on_delete", "csrf_token", "dialog element", "zoneinfo".
+    query: a few keywords, e.g. "ForeignKey on_delete", "csrf cookie get_token", "dialog element".
+    Common words are ignored. Sections with the most (and rarest) keywords come first.
     source: "python", "django", "html" or "all".
-    Returns sections as path:line with a snippet; read them with read_doc.
+    Each result gives the path and the line to pass to read_doc as start_line.
     """
-    terms = [t for t in re.findall(r"[\w.<>/-]+", query.lower()) if t]
+    words = re.findall(r"[\w.<>/-]+", query.lower())
+    terms = list(dict.fromkeys(w for w in words if w not in STOPWORDS and len(w) > 1))
     if not terms:
-        raise ToolError("empty query")
+        raise ToolError("no keywords in the query (common words are ignored)")
     if source != "all" and source not in {s for s, *_ in INDEX}:
         raise ToolError(f"unknown source: {source} (available: {', '.join(sorted({s for s, *_ in INDEX}))}, all)")
+    sections = [x for x in INDEX if source == "all" or x[0] == source]
+    hits = [[body.count(t) for t in terms] for _, _, _, _, body in sections]
+    # 語の珍しさ(IDF): 多くの節に出る語ほど軽くする
+    df = [sum(1 for h in hits if h[k]) for k in range(len(terms))]
+    idf = [math.log((len(sections) + 1) / (d + 1)) + 0.1 for d in df]
     scored = []
-    for src, path, line, title, body in INDEX:
-        if source != "all" and src != source:
+    for (src, path, line, title, body), h in zip(sections, hits):
+        matched = [k for k in range(len(terms)) if h[k]]
+        if not matched:
             continue
-        hits = [body.count(t) for t in terms]
-        if not all(hits):
-            continue
-        tl = title.lower()
-        score = sum(min(h, 20) for h in hits) + 15 * sum(t in tl for t in terms) \
-            + 5 * sum(t in path.lower() for t in terms) - len(body) / 20000
-        scored.append((score, src, path, line, title, body))
+        tl, pl = title.lower(), path.lower()
+        score = sum(idf[k] * (1 + math.log(h[k])) + 3 * idf[k] * (terms[k] in tl) + idf[k] * (terms[k] in pl)
+                    for k in matched) - len(body) / 50000
+        if "/releases/" in path or "/whatsnew/" in path:
+            score *= 0.5                                   # 変更履歴より、今の動作の説明を先に出す
+        scored.append((len(matched), score, src, path, line, title, body, matched))
     if not scored:
-        return f"No sections contain all of: {', '.join(terms)}. Try fewer or different keywords."
-    scored.sort(key=lambda x: -x[0])
+        return f"No sections contain any of: {', '.join(terms)}. Try other keywords."
+    scored.sort(key=lambda x: (-x[0], -x[1]))
     out = []
-    for _, src, path, line, title, body in scored[:MAX_RESULTS]:
-        pos = body.find(terms[0])
+    if scored[0][0] < len(terms):
+        out.append(f"No section contains all of: {', '.join(terms)}. Showing the closest matches.")
+    for n, _, src, path, line, title, body, matched in scored[:MAX_RESULTS]:
+        rare = max(matched, key=lambda k: idf[k])          # いちばん珍しい語の周りを抜き出す
+        pos = body.find(terms[rare])
         snippet = " ".join(body[max(pos - 80, 0):pos + 160].split())
-        out.append(f"{path}:{line}  [{src}] {title}\n    ...{snippet}...")
+        got = "" if n == len(terms) else f" (matched {n}/{len(terms)}: {', '.join(terms[k] for k in matched)})"
+        out.append(f"{path}:{line}  [{src}] {title}{got}\n"
+                   f"    read_doc(\"{path}\", start_line={line})\n    ...{snippet}...")
     return "\n".join(out)
 
 
