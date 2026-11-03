@@ -360,7 +360,7 @@ This compares only one PR, so it is worth comparing on other PRs too. To review 
 ## Limitations and caveats
 
 - The diff is truncated at about 160,000 characters (context length 131072 tokens). Files after the cut are not reviewed
-- Thinking is limited to 8,000 tokens per request (`THINK_LIMIT` in `review.py`). Beyond that it is cut off,
+- Thinking is limited to 3,000 tokens per request (`THINK_LIMIT` in `review.py`, or `review.py --think-limit`). Beyond that it is cut off,
   the thinking so far is passed back as "review notes", and the model writes the body without thinking.
   This stops it from re-examining the same findings over and over without getting to the body (over 20,000 tokens on pbl-app-2026 #49)
 - Reviews may contain mistakes. When posting with `--post`, check the content before posting

@@ -137,7 +137,10 @@ MAX_OUTPUT_TOKENS = 40_960
 # 1 回のリクエストで考える過程に使ってよいトークン数。超えたらそこで打ち切り、それまでの考える過程を
 # 検討メモとして渡して、考える過程なしで本文を書かせる(調べた内容を捨てずに、すぐ本文に移れる)。
 # pbl-app-2026 #49 では、ツールを使い終えた後に同じ指摘の見直しを繰り返し、考える過程が 2 万トークンを超えた。
-THINK_LIMIT = 8_000
+# 8,000 のときは、このリポジトリ自身の PR #1(3 パート)で 4 回とも上限まで考え、その 4 回だけで 1,131 秒、
+# 全体(1,596 秒)の 7 割を占めた。上限の後は検討メモから書くので、短くしても調べた内容は残る。
+# review.py --think-limit で変えられる
+THINK_LIMIT = 3_000
 
 # ツールを外した後に本文が空だったときの指示
 REVIEW_ONLY_PROMPT = """ツールはもう使えません。ツールを呼ばず、これまでに得た差分・ツールの結果・検討をもとに、
@@ -530,7 +533,10 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--stream", help="file to append the output to while it is generated")
     ap.add_argument("--mcp-config", help="MCP servers whose tools the model may call (.mcp.json format)")
+    ap.add_argument("--think-limit", type=int, default=THINK_LIMIT,
+                    help=f"thinking tokens per request before writing from the notes (default {THINK_LIMIT})")
     args = ap.parse_args()
+    globals()["THINK_LIMIT"] = args.think_limit
 
     with open(args.pr_json, encoding="utf-8") as f:
         pr = json.load(f)
