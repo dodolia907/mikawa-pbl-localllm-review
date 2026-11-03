@@ -98,6 +98,18 @@ def scope_note(paths, scopes=()):
 
 # 1 回のリクエストで生成するトークン数の上限。これに達して本文が空なら、考える過程なしでやり直す。
 MAX_OUTPUT_TOKENS = 40_960
+# 1 回のリクエストで考える過程に使ってよいトークン数。超えたらそこで打ち切り、それまでの考える過程を
+# 検討メモとして渡して、考える過程なしで本文を書かせる(調べた内容を捨てずに、すぐ本文に移れる)。
+# pbl-app-2026 #49 では、ツールを使い終えた後に同じ指摘の見直しを繰り返し、考える過程が 2 万トークンを超えた。
+THINK_LIMIT = 8_000
+
+# 考える過程を打ち切ったときに、検討メモと一緒に渡す指示
+MEMO_PROMPT = """考える過程が長くなったため、ここで打ち切りました。下は、ここまでのあなたの検討メモです。
+これ以上の検討はせず、このメモと、これまでに得た差分・ツールの結果だけをもとに、指定の出力形式でレビューを書いてください。
+メモの中で確かめきれなかった点は「要確認」と明記してください。
+
+## 検討メモ
+"""
 
 
 def split_diff(diff):
@@ -236,6 +248,9 @@ class StreamWriter:
         n, ns = res.get("eval_count") or self.req_tokens, res.get("eval_duration") or 0
         self.tokens += n - self.req_tokens     # 概算の数を、Ollama が数えた正しい数に置き換える
         rate = f", {n / (ns / 1e9):.0f} tok/s" if ns else ""
+        if res.get("done_reason") == "thinking_limit":
+            self.note(f"\n\n=== Stopped thinking at {n} tokens, {time.time() - self.req_t0:.0f}s ===\n")
+            return
         self.note(f"\n\n=== {res.get('prompt_eval_count')} input tokens (read in {wait_s:.0f}s), "
                   f"{n} output tokens{rate}, {time.time() - self.req_t0:.0f}s ===\n")
 
@@ -265,6 +280,7 @@ def chat_once(host, messages, model, stream, tools=None, think=None, timeout=360
     req = urllib.request.Request(f"{host}/api/chat", data=json.dumps(req_body).encode(),
                                  headers={"Content-Type": "application/json"})
     content, thinking, calls, first, res = [], [], [], None, None
+    n_think = 0                               # 考える過程のチャンク数(およそトークン数)
     t0 = time.time()
     with urllib.request.urlopen(req, timeout=timeout) as r:
         for line in r:                        # 1 行に 1 つの JSON が届く
@@ -279,6 +295,12 @@ def chat_once(host, messages, model, stream, tools=None, think=None, timeout=360
             if msg.get("thinking"):
                 thinking.append(msg["thinking"])
                 stream.write("thinking", msg["thinking"])
+                n_think += 1
+                if think is not False and n_think >= THINK_LIMIT and not content and not calls:
+                    # 接続を閉じると Ollama は生成をやめる。応答は打ち切った印を付けて返す
+                    res = {"done_reason": "thinking_limit", "eval_count": n_think,
+                           "prompt_eval_count": None, "eval_duration": 0}
+                    break
             if msg.get("content"):
                 content.append(msg["content"])
                 stream.write("content", msg["content"])
@@ -309,6 +331,16 @@ def chat(host, model, system, user, stream, think=None, tools=None, timeout=3600
         res = chat_once(host, messages, model, stream, schemas, think, timeout)
         prompt_tokens += res.get("prompt_eval_count") or 0
         output_tokens += res.get("eval_count") or 0
+        if res.get("done_reason") == "thinking_limit":
+            # 考える過程を検討メモとして渡し、考える過程もツールもなしで本文を書かせる
+            stream.begin(f"Thinking limit reached ({res['eval_count']:,} tokens); "
+                         "writing the review from the notes", stream.part, stream.total)
+            messages.append({"role": "user", "content": MEMO_PROMPT + res["message"]["thinking"]})
+            res = chat_once(host, messages, model, stream, None, False, timeout)
+            prompt_tokens += res.get("prompt_eval_count") or 0
+            output_tokens += res.get("eval_count") or 0
+            res["thinking_cut"] = True
+            break
         calls = res["message"].get("tool_calls")
         if not calls or not schemas:
             break
