@@ -333,6 +333,7 @@ submit_job() {
   JOB=$(qsub -o "$RUN/job.log" "${QSUB_ARGS[@]}" -l "walltime=$WALL" \
     -v "$QSUB_VARS,RUN_DIR=$RUN,MODEL=$MODEL,ROOT=$ROOT" "$ROOT/jobs/review.pbs")
   MODE=job STATE=Q
+  echo "$JOB" > "$RUN/job"                  # --no-wait の後でも状態を調べられるよう残す(review-mcp が使う)
   echo "${DIM}Job ${JOB%%.*} on $QUEUE (${NGPUS} GPU, up to $WALL), model $MODEL${RESET}" >&2
 }
 
