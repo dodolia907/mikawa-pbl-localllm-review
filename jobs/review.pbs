@@ -15,8 +15,7 @@ exec > >(tee -a "$RUN_DIR/progress") 2>&1
 OLLAMA_LOG=$RUN_DIR/ollama.log
 . "$ROOT/jobs/ollama_env.sh"
 
+. "$ROOT/jobs/run_review.sh"
 echo "Reviewing"
 # 生成途中の出力を stream.txt に書き足していく(review-pr がこれを画面に流す)
-python3 "$ROOT/review.py" --host "$OLLAMA_URL" --model "$MODEL" \
-  --pr-json "$RUN_DIR/pr.json" --diff "$RUN_DIR/pr.diff" --out "$RUN_DIR/review.md" \
-  --stream "$RUN_DIR/stream.txt"
+run_review "$OLLAMA_URL" "$MODEL" "$RUN_DIR"

@@ -30,6 +30,7 @@ touch heartbeat
 
 OLLAMA_LOG=$SERVER_DIR/ollama.log
 . "$ROOT/jobs/ollama_env.sh"        # Ollama を起動し、$MODEL を GPU に読み込む
+. "$ROOT/jobs/run_review.sh"        # run_review(実行ディレクトリに mcp.json があれば MCP のツールを使う)
 LOADED=$MODEL
 
 echo "$(hostname -s) $MODEL $END_TS" > info
@@ -62,9 +63,7 @@ while :; do
     set -e
     # 依頼のモデルが載っているものと違えば、取得して読み込む(前のモデルは Ollama が必要に応じて降ろす)
     if [ "$REQ_MODEL" != "$LOADED" ]; then pull_model "$REQ_MODEL"; load_on_gpu "$REQ_MODEL"; fi
-    python3 "$ROOT/review.py" --host "$OLLAMA_URL" --model "$REQ_MODEL" \
-      --pr-json "$RUN_DIR/pr.json" --diff "$RUN_DIR/pr.diff" --out "$RUN_DIR/review.md" \
-      --stream "$RUN_DIR/stream.txt"
+    run_review "$OLLAMA_URL" "$REQ_MODEL" "$RUN_DIR"
   ) > "$RUN_DIR/job.log" 2>&1 &
   pid=$!
   # レビュー中も heartbeat を更新し、取り消しの依頼を見る
