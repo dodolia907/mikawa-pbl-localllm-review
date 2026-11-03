@@ -1,112 +1,112 @@
 # mikawa-pbl-localllm-review
 
-豊橋技科大 HPC の GPU でローカル LLM を動かし、GitHub の PR をレビューする CLI。
-`iEduq`(NVIDIA A100)と `Eduq`(AMD MI210)のどちらでも動く。
+A CLI that reviews GitHub pull requests with a local LLM running on the GPUs of the Toyohashi University of Technology HPC.
+It works on both `iEduq` (NVIDIA A100) and `Eduq` (AMD MI210).
 
 ```bash
 ./review-pr TechnoTUT/dmxctl 3
 ./review-pr https://github.com/TechnoTUT/dmxctl/pull/3
 ```
 
-## 仕組み
+## How it works
 
 ```mermaid
 sequenceDiagram
-  participant U as 利用者
-  participant C as review-pr<br/>(窓口サーバ ydev)
+  participant U as User
+  participant C as review-pr<br/>(login server ydev)
   participant G as GitHub
-  participant J as ジョブ<br/>(GPU ノード iEduq A100 / Eduq MI210)
-  U->>C: review-pr owner/repo 番号
-  C->>G: gh で PR の情報と差分を取得
-  Note over C,J: GitHub のトークンは計算ノードに渡さない
-  C->>J: qsub で jobs/review.pbs を投入
-  J->>J: Ollama を起動し、モデルを用意して GPU に読み込む
-  J->>J: review.py で差分を渡してレビューを得る
-  J-->>C: stream.txt と review.md(共有の /work)
-  C-->>U: 終わるまで進み具合を表示(Ctrl-C でジョブも取り消す)
-  C-->>U: レビューを表示
+  participant J as Job<br/>(GPU node iEduq A100 / Eduq MI210)
+  U->>C: review-pr owner/repo number
+  C->>G: Fetch the PR details and diff with gh
+  Note over C,J: The GitHub token is never passed to the compute node
+  C->>J: Submit jobs/review.pbs with qsub
+  J->>J: Start Ollama, prepare the model and load it onto the GPU
+  J->>J: Pass the diff to review.py and get a review
+  J-->>C: stream.txt and review.md (on the shared /work)
+  C-->>U: Show progress until it finishes (Ctrl-C also cancels the job)
+  C-->>U: Print the review
   opt --post
-    C->>G: 確認のうえ PR にコメント
+    C->>G: Comment on the PR after confirmation
   end
 ```
 
-結果は `runs/<owner>_<repo>/pr<番号>-<日時>/` に残る。
+Results are kept in `runs/<owner>_<repo>/pr<number>-<datetime>/`.
 
-| ファイル | 中身 |
+| File | Contents |
 |---|---|
-| `review.md` | レビュー |
-| `src/` / `mcp.json` | `--mcp` のとき: PR 適用後のソース / MCP サーバの設定 |
-| `pr.json` / `pr.diff` | PR の情報と差分 |
-| `progress` | ジョブの進み具合 |
-| `stream.txt` / `stream.txt.stat` | 生成途中の出力 / 段階とトークン数 |
-| `job.log` / `ollama.log` | ジョブと Ollama のログ |
+| `review.md` | The review |
+| `src/` / `mcp.json` | With `--mcp`: the source with the PR applied / MCP server settings |
+| `pr.json` / `pr.diff` | PR details and diff |
+| `progress` | Job progress |
+| `stream.txt` / `stream.txt.stat` | Output while generating / stage and token count |
+| `job.log` / `ollama.log` | Job and Ollama logs |
 
-## 初回セットアップ(窓口サーバで 1 回だけ)
+## First-time setup (once, on the login server)
 
 ```bash
-# gh(管理者権限なしで ~/.local/bin に導入済み)のログイン
+# Log in to gh (installed in ~/.local/bin without admin rights)
 gh auth login
 
-# Ollama を /work/$USER/llm に展開(約 1.4GB)
+# Extract Ollama into /work/$USER/llm (about 1.4GB)
 mkdir -p /work/$USER/llm/ollama && cd /work/$USER/llm
 curl -fL -o ollama-linux-amd64.tar.zst \
   https://github.com/ollama/ollama/releases/download/v0.40.13/ollama-linux-amd64.tar.zst
 tar --use-compress-program=zstd -xf ollama-linux-amd64.tar.zst -C ollama
 
-# Eduq(AMD MI210)でも使う場合は、AMD(ROCm)版のライブラリを同じ場所に追加で展開する(約 1GB)
+# To also use Eduq (AMD MI210), extract the AMD (ROCm) libraries into the same place (about 1GB)
 curl -fL -o ollama-linux-amd64-rocm.tar.zst \
   https://github.com/ollama/ollama/releases/download/v0.40.13/ollama-linux-amd64-rocm.tar.zst
 tar --use-compress-program=zstd -xf ollama-linux-amd64-rocm.tar.zst -C ollama
 ```
 
-モデル(既定 `flint:40b`、約 23GB)は初回のジョブの中で `/work/$USER/llm/models` に取得され、以降は使い回される。
+The model (default `flint:40b`, about 23GB) is pulled into `/work/$USER/llm/models` during the first job and reused afterwards.
 
-## 使い方
+## Usage
 
 ```
-review-pr [オプション] <owner/repo> <PR番号>
-review-pr [オプション] <PR の URL>
-review-pr [オプション] <owner/repo>  (PR などを対話モードで選ぶ)
-review-pr                       (引数なし: 対話モードで順に選ぶ)
+review-pr [options] <owner/repo> <PR number>
+review-pr [options] <PR URL>
+review-pr [options] <owner/repo>  (choose the PR and the rest interactively)
+review-pr                       (no arguments: choose everything interactively)
 
-  -i, --interactive    対話モードで選ぶ(引数やオプションで指定した値が既定値になる)
-  -q, --queue QUEUE    使うキュー: iEduq(NVIDIA A100、既定)か Eduq(AMD MI210)
-  -g, --gpus N         使う GPU 数(iEduq は 1、Eduq は 1〜2。既定 1)
-  -H, --host NODE      ノードを固定する(例 yind01)
-  -m, --model MODEL    Ollama のモデル(既定 flint:40b)
-  -o, --output FILE    レビューを FILE にも保存する
-      --mcp            モデルが MCP のツールでリポジトリを読み、検査し、資料を引けるようにする(後述)
-      --scope DIR      --mcp のツールが読めるのを、リポジトリの DIR の中だけにする(例 teams/invtechno)
-      --post           レビューを PR にコメントとして投稿する(投稿前に確認する)
-      --no-wait        ジョブを投入したら待たずに終わる
-      --quiet          生成途中の出力を流さず、状態表示だけにする
-      --new-job        レビューサーバが動いていても、新しいジョブで実行する
-      --server         レビューサーバで実行する(動いていなければエラー)
-      --start-server   レビューサーバが動いていなければ起動し(最長 8 時間)、モデルの読み込みを待ってから依頼する
+  -i, --interactive    Choose interactively (values given as arguments or options become the defaults)
+  -q, --queue QUEUE    Queue to use: iEduq (NVIDIA A100, default) or Eduq (AMD MI210)
+  -g, --gpus N         Number of GPUs (1 on iEduq, 1-2 on Eduq; default 1)
+  -H, --host NODE      Pin the node (e.g. yind01)
+  -m, --model MODEL    Ollama model (default flint:40b)
+  -o, --output FILE    Also save the review to FILE
+      --mcp            Let the model read the repository, run checks and look up docs with MCP tools (see below)
+      --scope DIR      Limit what the --mcp tools can read to DIR in the repository (e.g. teams/invtechno)
+      --post           Post the review as a PR comment (asks for confirmation first)
+      --no-wait        Exit right after submitting the job
+      --quiet          Show only the status line, not the output while generating
+      --new-job        Run in a new job even if a review server is running
+      --server         Run on the review server (error if none is running)
+      --start-server   Start a review server if none is running (up to 8 hours), wait for the model to load, then send the request
 ```
 
-進み具合は標準エラーに、レビュー本文は標準出力に出るので、`> review.md` で本文だけ保存できる。
+Progress goes to stderr and the review body to stdout, so `> review.md` saves just the body.
 
-### 対話モード
+### Interactive mode
 
-引数なしで実行すると、リポジトリを入力した後、次の項目を矢印キーか Vim のキーで選ぶ。
-`./review-pr TechnoTUT/dmxctl` のようにリポジトリだけを指定すると、PR の選択から始まる。
+Run without arguments, enter the repository, then choose each of the following with the arrow keys or Vim keys.
+Give only the repository, as in `./review-pr TechnoTUT/dmxctl`, to start from choosing the PR.
 
-- PR(オープンな PR の一覧。「その他」で番号を入力すれば、マージ済みの PR なども指定できる)
-- キューと GPU(iEduq × 1、Eduq × 1、Eduq × 2)
-- モデル(取得済みの一覧。「その他」で名前を入力できる)
-- ノード(自動か固定)、PR に投稿するか、終わるまで待つか
+- PR (list of open PRs; choose "Other" and enter a number to pick a merged PR or the like)
+- Queue and GPUs (iEduq × 1, Eduq × 1, Eduq × 2)
+- Model (list of pulled models; choose "Other" to enter a name)
+- Node (automatic or pinned), whether to post to the PR, whether to wait until it finishes
 
-| キー | 動き |
+| Key | Action |
 |---|---|
-| `↑` / `k`、`↓` / `j` | 上下に移動 |
-| `g` / `G` | 先頭 / 末尾へ |
-| `1`〜`9` | その番号の選択肢へ |
-| Enter | 決定 |
-| `q`(または Ctrl-C) | 中止 |
+| `↑` / `k`, `↓` / `j` | Move up / down |
+| `g` / `G` | Go to first / last |
+| `1`-`9` | Go to that option |
+| Enter | Select |
+| `q` (or Ctrl-C) | Cancel |
 
-最後に同じ内容を引数で指定するコマンドを表示し、確認してから実行する。
-`-i` を付けると、引数やオプションで指定した値を既定値にして対話モードに入る。
+At the end it shows the equivalent command with arguments and runs it after confirmation.
+With `-i`, interactive mode starts with the values given as arguments or options as defaults.
 
 ```
 $ ./review-pr
@@ -118,11 +118,11 @@ Queue / GPU  (↑↓ / j k to move, Enter to select, q to cancel)
   Eduq   AMD MI210 64GB x2 (ysnd00/01; for models over 64GB, no speedup for models that fit on one)
 ```
 
-### 実行中の表示
+### Display while running
 
-ジョブを待つ間、画面の一番下に Claude Code 風の状態表示の行を出す。
-考える過程(thinking)は、そのすぐ上の高さを固定した枠(既定 5 行)の中で、最新の行だけを入れ替えて薄い色で見せる。
-画面は流れない。レビュー本文・ツールの呼び出し・見出しは、枠の上に確定して流す。
+While waiting for the job, a Claude Code-style status line sits at the bottom of the screen.
+The thinking is shown in a dim color in a fixed-height box just above it (5 lines by default), where only the newest lines are swapped in.
+The screen does not scroll for it. The review body, tool calls and headings are committed above the box and scroll up.
 
 ```
 Reviewing the diff (12,345 chars)
@@ -136,84 +136,84 @@ Tool: repo__read_file {"path": "teams/invtechno/docs/api.md"} -> teams/invtechno
 Deliberating… (2m 41s · ↓ 3.4k tokens · thinking · ctrl+c to cancel)
 ```
 
-- 枠の行数は `--think-lines N` で変えられる(`0` で考える過程を出さない)。本文が始まると枠は消える
-- 枠に収まらない長い行は、末尾(今書いている所)を見せる
-- 状態表示の行は、経過時間・生成したトークン数・段階(queued → starting ollama → loading model onto gpu → reading diff → thinking → using tools → writing review)を示す。本文を書いている間は、末尾に生成途中の行を出す
-- 先頭の言葉(Deliberating など)の上を明るいシアンの帯が流れる。言葉は段階が変わるたびに変わる
-- 本文はすでに画面に流れているので、終わった後は保存先だけを表示する。標準出力をリダイレクトしたときは、本文を出力する
-- `--quiet` を付けると、生成途中の出力を流さず、状態表示だけにする
-- 端末でないとき(ログに保存するときなど)は、アニメーションの代わりに段階の変化を 1 行ずつ出し、考える過程もすべて流す
-- CLI が表示する文言は英語。レビュー本文は日本語(`review.py` のプロンプトで指定)
+- Change the box height with `--think-lines N` (`0` hides the thinking). The box disappears once the body starts
+- Lines too long for the box show their end (where it is currently writing)
+- The status line shows the elapsed time, the number of tokens generated and the stage (queued → starting ollama → loading model onto gpu → reading diff → thinking → using tools → writing review). While the body is being written, the line being generated is shown at the end
+- A bright cyan band sweeps across the leading word (Deliberating, etc.). The word changes with each stage
+- Since the body has already scrolled by, only the save location is shown at the end. When stdout is redirected, the body is written there
+- With `--quiet`, the output while generating is not shown, only the status line
+- When not on a terminal (e.g. when saving to a log), stage changes are printed one per line instead of the animation, and all of the thinking is printed
+- The CLI's messages are in English. The review body is in Japanese (specified in the prompt in `review.py`)
 
-### キュー
+### Queues
 
-| キュー | ノード | GPU | 1 ジョブの上限 |
+| Queue | Nodes | GPU | Per-job limits |
 |---|---|---|---|
-| `iEduq` | yind00, yind01 | NVIDIA A100 80GB × 1 | CPU 8、メモリ 64GB、8 時間。flint で約 56 トークン/秒 |
-| `Eduq` | ysnd00, ysnd01 | AMD Instinct MI210 64GB × 2 | CPU 8、メモリ 64GB、GPU 2、8 時間。flint で約 30 トークン/秒 |
+| `iEduq` | yind00, yind01 | NVIDIA A100 80GB × 1 | 8 CPUs, 64GB memory, 8 hours. About 56 tokens/s with flint |
+| `Eduq` | ysnd00, ysnd01 | AMD Instinct MI210 64GB × 2 | 8 CPUs, 64GB memory, 2 GPUs, 8 hours. About 30 tokens/s with flint |
 
-- どちらも同時実行は 1 人 1 ジョブ。2 つのキューは別々なので、iEduq と Eduq で 1 本ずつ同時に動かせる
-- ジョブが保留(H)になると、`review-pr` はジョブを取り消して終わる。ノードの不調の可能性があるので、`-H` で別のノードを指定する
+- Each queue allows one running job per user. The two queues are separate, so you can run one job on iEduq and one on Eduq at the same time
+- If a job goes on hold (H), `review-pr` cancels it and exits. The node may be unhealthy, so pin another node with `-H`
 
-## レビューサーバ(モデルを載せたまま続けてレビューする)
+## Review server (keep the model loaded for consecutive reviews)
 
-`review-pr` を毎回ジョブとして実行すると、ジョブの開始から Ollama の起動・GPU の検出・モデルの読み込みまでに
-iEduq で約 1 分 45 秒(Eduq で約 35 秒)かかり、さらにキューの順番待ちもある。
-`review-server start` で常駐ジョブ(最長 8 時間)を立てておくと、モデルを GPU に載せたまま、
-`review-pr` からの依頼を順にレビューする。2 件目からは数秒で生成が始まる(2026-11-03 の実測で 5.5 秒)。
+Running `review-pr` as a new job each time takes about 1 min 45 s on iEduq (about 35 s on Eduq) from job start
+through starting Ollama, detecting the GPU and loading the model, on top of waiting in the queue.
+`review-server start` launches a resident job (up to 8 hours) that keeps the model on the GPU
+and reviews requests from `review-pr` in turn. From the second request on, generation starts within seconds (5.5 s measured on 2026-11-03).
 
 ```bash
-./review-server start              # iEduq で 8 時間。モデルを読み込み終わるまで待つ(約 1〜2 分)
-./review-server start -q Eduq -t 4 # Eduq で 4 時間
-./review-server status             # 動いているサーバ、残り時間、実行中・待ちの依頼
-./review-server stop               # 実行中のレビューを終えてから止める(--now ですぐ止める)
+./review-server start              # 8 hours on iEduq. Waits until the model is loaded (about 1-2 min)
+./review-server start -q Eduq -t 4 # 4 hours on Eduq
+./review-server status             # Running servers, time left, running and queued requests
+./review-server stop               # Stop after the running review finishes (--now to stop immediately)
 
-./review-pr TechnoTUT/dmxctl 3     # サーバが動いていれば自動でサーバに依頼する
-./review-pr --new-job TechnoTUT/dmxctl 3   # サーバがあっても新しいジョブで実行する
-./review-pr --start-server TechnoTUT/dmxctl 3   # サーバがなければ起動してから依頼する(-q でキューを選ぶ)
+./review-pr TechnoTUT/dmxctl 3     # Sends the request to the server automatically if one is running
+./review-pr --new-job TechnoTUT/dmxctl 3   # Runs in a new job even if a server is running
+./review-pr --start-server TechnoTUT/dmxctl 3   # Starts a server if none is running, then sends the request (choose the queue with -q)
 ```
 
-- 依頼は 1 件ずつ順に処理する。待っている間、状態表示の行に「waiting for the server (1 ahead)」のように前の件数を出す
-- 対話モードでは、動いているサーバが「Where to run」の最初の選択肢になる。
-  「Start a review server (up to 8h)」を選ぶと、サーバの動いていないキューから起動先を選べる(`--start-server` と同じ)
-- `--start-server` でサーバを待っている間に Ctrl-C を押すと、その依頼だけをやめる。サーバは起動を続ける
-- サーバと `review-pr` は共有の `/work` 上のファイル(`server/<ID>/`)でやりとりする。ポートは開けないので、
-  ほかの利用者からは使えない
-- 依頼したモデルが載っているものと違えば、サーバがそのモデルに切り替える
-- 残り時間が足りない依頼はサーバが断り、`review-pr` は自動で新しいジョブに切り替える
-- サーバも 1 ジョブとして数えるので、同じキューでは、サーバを動かしている間は別のジョブは順番待ちになる
-  (`--new-job` は、もう一方のキューで使うとよい)
+- Requests are processed one at a time. While waiting, the status line shows how many are ahead, e.g. "waiting for the server (1 ahead)"
+- In interactive mode, a running server is the first option under "Where to run".
+  Choosing "Start a review server (up to 8h)" lets you pick a queue with no server running to start one (same as `--start-server`)
+- Pressing Ctrl-C while `--start-server` is waiting for the server cancels only that request. The server keeps starting
+- The server and `review-pr` communicate through files on the shared `/work` (`server/<ID>/`). No port is opened,
+  so other users cannot use it
+- If the requested model differs from the loaded one, the server switches to that model
+- The server rejects requests that would not fit in the remaining time, and `review-pr` automatically falls back to a new job
+- The server counts as a job, so while it runs, other jobs on the same queue wait their turn
+  (use `--new-job` on the other queue)
 
-## MCP のツールを使う(--mcp)
+## Using MCP tools (--mcp)
 
-`--mcp` を付けると、モデルがレビュー中に MCP のツールを呼べるようになる。差分だけでは判断できないこと
-(変更された関数の呼び出し元、型や定数の定義、設定ファイルなど)をリポジトリのファイルを読んで確かめたり、
-Python・HTML・Django テンプレートを検査したり、使っている版の公式資料で API の使い方を確かめたりできる。
+With `--mcp`, the model can call MCP tools during the review. It can read files in the repository to check things
+the diff alone cannot settle (callers of a changed function, type and constant definitions, config files, etc.),
+check Python, HTML and Django templates, and confirm API usage in the official docs for the version in use.
 
-| サーバ | ツール | 中身 |
+| Server | Tools | What they do |
 |---|---|---|
-| `repo` | `read_file` / `search` / `list_files` | PR 適用後のリポジトリを読む(行番号付き、1 回 400 行まで) |
-| `check` | `check_python` | ruff で構文エラー・未定義の名前・使っていない import・bugbear の規則を調べる(書式の規則は使わない) |
-| | `check_template` | HTML と Django テンプレートの、開きタグと閉じタグ・`{% if %}`〜`{% endif %}` などの対応を調べる |
-| `docs` | `search_docs` / `read_doc` | Python・Django・HTML(MDN)の公式資料を検索して読む。検索は機能語(on・which など)を無視し、全部の語を含む節がなければ、含む語の多い順(珍しい語ほど重く)に出す。変更履歴(releases)より今の動作の説明を先に出す |
+| `repo` | `read_file` / `search` / `list_files` | Read the repository with the PR applied (with line numbers, up to 400 lines per call) |
+| `check` | `check_python` | Check for syntax errors, undefined names, unused imports and bugbear rules with ruff (no formatting rules) |
+| | `check_template` | Check that HTML and Django templates have matching open and close tags, `{% if %}`…`{% endif %}`, etc. |
+| `docs` | `search_docs` / `read_doc` | Search and read the official Python, Django and HTML (MDN) docs. The search ignores function words (on, which, etc.); if no section contains every word, results are ranked by how many words they contain (rarer words weigh more). Descriptions of current behaviour come before changelogs (releases) |
 
-モデルには、Django・Python・HTML の動作を根拠にする指摘(CSRF・Cookie、フィールドの引数、テンプレートタグなど)は
-記憶で書かず、`docs` で確かめて根拠の資料のパスを添えるよう指示している(確かめられなければ「要確認」)。
-プロンプトのツールの説明は、起動したサーバの分だけ載せる(資料を取得していなければ `docs` の説明は載らない)。
+The model is told not to write findings that rest on Django, Python or HTML behaviour (CSRF and cookies, field arguments,
+template tags, etc.) from memory, but to check them with `docs` and cite the path of the doc it relied on (or mark them "needs checking" if it cannot confirm).
+The prompt only describes the tools of servers that were started (if the docs have not been fetched, `docs` is not described).
 
-`check` は PR のコードを実行しない(ファイルを読んで調べるだけ)。`manage.py check` やテストのように
-コードを動かす検査は、計算ノードで学生のコードが動き、共有の `/home` にある gh の認証情報などに
-触れられてしまうので入れていない。
+`check` does not run the PR's code (it only reads and inspects files). Checks that run code, such as `manage.py check` or tests,
+are left out because students' code would run on the compute node and could reach things like the gh credentials
+on the shared `/home`.
 
-資料は窓口サーバで 1 回取得しておく(約 25MB、`/work/$USER/llm/docs`)。取得していなければ `docs` は使わない:
+Fetch the docs once on the login server (about 25MB, into `/work/$USER/llm/docs`). If they have not been fetched, `docs` is not used:
 
 ```bash
-./fetch-docs                               # Python 3.14、Django 6.1.2、HTML(MDN)
-./fetch-docs --python 3.13 --django 5.2.8  # 別の版を足す
+./fetch-docs                               # Python 3.14, Django 6.1.2, HTML (MDN)
+./fetch-docs --python 3.13 --django 5.2.8  # Add other versions
 ```
 
-使う版は、レビューするリポジトリの `pyproject.toml`(`requires-python`、`django==`)や `requirements*.txt` から選ぶ
-(合う版がなければ取得済みの最も新しい版)。Django を使っていないリポジトリでは Django の資料を渡さない。
+The version is chosen from the reviewed repository's `pyproject.toml` (`requires-python`, `django==`) or `requirements*.txt`
+(the newest fetched version if none matches). Repositories that do not use Django are not given the Django docs.
 
 ```bash
 ./review-pr --mcp TechnoTUT/dmxctl 3
@@ -221,64 +221,64 @@ Python・HTML・Django テンプレートを検査したり、使っている版
 
 ```mermaid
 flowchart TB
-  subgraph ydev["窓口サーバ(review-pr)"]
-    A["gh api で PR の head のソース(tarball)を取得<br/>runs/.../src/"]
-    B["MCP サーバの設定を書く<br/>runs/.../mcp.json"]
+  subgraph ydev["Login server (review-pr)"]
+    A["Fetch the source (tarball) at the PR head with gh api<br/>runs/.../src/"]
+    B["Write the MCP server settings<br/>runs/.../mcp.json"]
     A --> B
   end
-  subgraph node["ジョブ(GPU ノード)"]
-    R["review.py<br/>uv の Python 3.12 + mcp SDK"]
+  subgraph node["Job (GPU node)"]
+    R["review.py<br/>Python 3.12 from uv + mcp SDK"]
     O["Ollama"]
-    subgraph mcp["MCP サーバ(stdio で起動、読み取り専用)"]
+    subgraph mcp["MCP servers (started over stdio, read-only)"]
       S1["repo<br/>read_file / search / list_files"]
       S2["check<br/>check_python / check_template"]
       S3["docs<br/>search_docs / read_doc"]
     end
-    R -- "差分とツールの一覧" --> O
-    O -- "ツールの呼び出し" --> R
-    R -- "ツールを実行" --> mcp
-    mcp -- "結果" --> R
+    R -- "Diff and tool list" --> O
+    O -- "Tool calls" --> R
+    R -- "Run the tool" --> mcp
+    mcp -- "Result" --> R
   end
   B --> R
-  D[("資料<br/>/work/$USER/llm/docs")] -.-> S3
+  D[("Docs<br/>/work/$USER/llm/docs")] -.-> S3
 ```
 
-モデルがツールを呼ぶたびに review.py が MCP サーバで実行して結果を返し、答えが出るまで繰り返す。
+Each time the model calls a tool, review.py runs it on the MCP server and returns the result, repeating until the model gives an answer.
 
-- どのツールも読み取り専用で、`src/`(と資料)の外は読めない
-- 1 パートあたり最大 12 回まで呼べる(結果の末尾に残りの回数を添える)。超えたらツールなしで書かせる。
-  そのうちリポジトリを読む `repo__*` は 6 回まで(`check`・`docs` もあるとき。`review.py` の `MAX_REPO_CALLS`)。
-  使い切ったら `repo__*` をツールの一覧から外し、それでも呼ばれたら実行せずに断る。
-  プロンプトで「読み回らない」と伝えるだけでは、チームの文書を片端から読み、資料で確かめる回数が残らなかった
-  呼んだツールは画面に薄い色で 1 行ずつ出る
-- 変更されたファイルに共通するフォルダ(例 `teams/invtechno`)をプロンプトで伝え、ほかのフォルダを読み回らないよう指示する。
-  モノレポでは、制限しないとチームの資料を片端から読み、考える過程も長くなる
-  (pbl-app-2026 #49 では、Markdown 2 ファイルの PR で 32 回呼び、考える過程が 1.9 万トークンを超えた)
-- ソースは窓口サーバで取得するので、gh のトークンは計算ノードに渡さない
-- 公式の mcp SDK(Python 3.10 以上)を使うため、uv で Python 3.12 と `mcp==2.3.0`、`ruff==0.17.3` の環境を用意する
-  (`jobs/run_review.sh`)。窓口サーバで取得してキャッシュ(`~/.cache/uv`)に入れ、ジョブはネットワークを使わない
-- ツールの結果の分だけ入力が増え、時間もかかる(ジョブの時間上限はパートごとに 15 分延ばす)
-- ツール呼び出しに対応したモデルが必要(`flint:40b` は対応)
+- Every tool is read-only and cannot read outside `src/` (and the docs)
+- Up to 12 calls per part (the number left is appended to each result). After that the model must write without tools.
+  Of those, the `repo__*` tools that read the repository are limited to 6 (when `check` and `docs` are also available; `MAX_REPO_CALLS` in `review.py`).
+  Once used up, `repo__*` is removed from the tool list, and calls that still come in are refused without running.
+  Only telling it "don't wander around reading" in the prompt left it reading the team's documents one after another, with no calls left to check the docs.
+  Each tool call is shown on screen as one dim line
+- The prompt names the folder common to the changed files (e.g. `teams/invtechno`) and tells the model not to wander through other folders.
+  In a monorepo, without this limit it reads the teams' documents one after another and the thinking grows long too
+  (on pbl-app-2026 #49, a PR touching two Markdown files, it made 32 calls and the thinking exceeded 19,000 tokens)
+- The source is fetched on the login server, so the gh token is never passed to the compute node
+- To use the official mcp SDK (Python 3.10+), an environment with Python 3.12, `mcp==2.3.0` and `ruff==0.17.3` is prepared with uv
+  (`jobs/run_review.sh`). It is downloaded on the login server and cached (`~/.cache/uv`), so the job does not use the network
+- Tool results add to the input and take more time (the job time limit is extended by 15 minutes per part)
+- The model must support tool calling (`flint:40b` does)
 
-### 読める範囲を制限する(--scope)
+### Limiting what can be read (--scope)
 
-モノレポで 1 チームだけを対象にするときは、`--scope` でツールが読めるフォルダを決める(`--mcp` も有効になる):
+To target just one team in a monorepo, set the folders the tools can read with `--scope` (this also enables `--mcp`):
 
 ```bash
 ./review-pr --scope teams/invtechno https://github.com/mikawa-pbl/pbl-app-2026/pull/49
-./review-pr --scope teams/invtechno,teams/mint ...   # カンマで複数
+./review-pr --scope teams/invtechno,teams/mint ...   # Comma-separated for several
 ```
 
-- `repo` と `check` は、範囲の外のパスを拒否する(`..`、絶対パス、範囲の外を指すシンボリックリンクも)。
-  `path` を省略すると範囲のフォルダが対象になり、`teams` のような上のフォルダを指定すると、その中の範囲だけを調べる
-- プロンプトでも「対象はこの中だけ」と伝える
-- 共通の設定(`pbl_project/settings.py` など)も読めなくなる。それも見せたいときは `--scope` に加える
-- `docs`(公式資料)は対象外(リポジトリではないため)
+- `repo` and `check` reject paths outside the scope (including `..`, absolute paths and symlinks pointing outside it).
+  Omitting `path` targets the scope folders, and giving a parent folder such as `teams` inspects only the scoped parts inside it
+- The prompt also says "only these folders are in scope"
+- Shared settings (such as `pbl_project/settings.py`) become unreadable too. Add them to `--scope` if you want them visible
+- `docs` (the official docs) is not affected, since it is not the repository
 
-### ほかの MCP サーバを足す
+### Adding other MCP servers
 
-リポジトリ直下に `mcp.json` を置くと、そのサーバも使う。形は Claude Code の `.mcp.json` と同じ。
-サーバは計算ノードで起動される。文字列の中の `${PYTHON}`(mcp SDK 入りの Python)、`${ROOT}`、`${RUN_DIR}` は置き換えられる。
+Put a `mcp.json` at the repository root to use its servers as well. The format is the same as Claude Code's `.mcp.json`.
+The servers are started on the compute node. `${PYTHON}` (a Python with the mcp SDK), `${ROOT}` and `${RUN_DIR}` in strings are substituted.
 
 ```json
 {"mcpServers": {
@@ -287,101 +287,101 @@ flowchart TB
 }}
 ```
 
-- HTTP のサーバは計算ノードから届く URL にする(ヘッダによる認証には対応していない)
-- uv はジョブの中では `--offline` で動くので、追加のサーバに必要なパッケージは事前に用意しておく
-- 追加のサーバのツールも「サーバ名__ツール名」でモデルに見せる。書き込みのできるツールは足さない
+- HTTP servers must use a URL reachable from the compute node (authentication via headers is not supported)
+- uv runs with `--offline` inside the job, so prepare any packages the extra servers need in advance
+- Tools of extra servers are also shown to the model as "server name__tool name". Do not add tools that can write
 
-## ほかの Claude Code から使う(MCP サーバ)
+## Using it from other Claude Code sessions (MCP server)
 
-`review-mcp` を MCP サーバ(stdio)として登録すると、ほかの Claude Code から「PR #49 をレビューして」のように頼める。
-窓口サーバでポートは開けないので、Claude Code がサーバを子プロセスとして起動する形にしている。
+Register `review-mcp` as an MCP server (stdio), and other Claude Code sessions can ask things like "review PR #49".
+No port is opened on the login server, so Claude Code starts the server as a child process.
 
 ```bash
-# 窓口サーバ(ydev)の Claude Code から
+# From Claude Code on the login server (ydev)
 claude mcp add llm-review -- /work/$USER/mikawa-pbl-localllm-review/review-mcp
 
-# ほかのマシンの Claude Code から(ydev は ~/.ssh/config で窓口サーバに付けた名前。パスワードを聞かれない鍵の設定が要る)
-claude mcp add llm-review -- ssh ydev /work/<ユーザー名>/mikawa-pbl-localllm-review/review-mcp
+# From Claude Code on another machine (ydev is the name given to the login server in ~/.ssh/config; needs a key that does not prompt for a password)
+claude mcp add llm-review -- ssh ydev /work/<username>/mikawa-pbl-localllm-review/review-mcp
 ```
 
-どのディレクトリでも使いたいときは `--scope user` を付ける。
+Add `--scope user` to use it from any directory.
 
 ```mermaid
 sequenceDiagram
   participant CC as Claude Code
-  participant M as review-mcp<br/>(窓口サーバ)
-  participant J as ジョブ<br/>(GPU ノード)
+  participant M as review-mcp<br/>(login server)
+  participant J as Job<br/>(GPU node)
   CC->>M: start_review(repo, pr_number, ...)
-  M->>J: review-pr --no-wait(ジョブの投入かサーバへの依頼)
+  M->>J: review-pr --no-wait (submit a job or send to the server)
   M-->>CC: run_id
-  loop 終わるまで(1 回の呼び出しで最大 120 秒待つ)
+  loop Until done (each call waits up to 120 s)
     CC->>M: get_review(run_id, wait_seconds)
-    M-->>CC: queued / running(段階・トークン数)
+    M-->>CC: queued / running (stage, token count)
   end
-  J-->>M: review.md(共有の /work)
+  J-->>M: review.md (on the shared /work)
   CC->>M: get_review(run_id)
-  M-->>CC: done とレビュー本文
+  M-->>CC: done and the review body
 ```
 
-| ツール | 中身 |
+| Tool | What it does |
 |---|---|
-| `start_review` | PR のレビューを依頼し、`run_id` を返す。`model`・`queue`・`use_tools`(`--mcp`)・`scope`・`new_job` を選べる |
-| `get_review` | 状態(queued / running / done / failed)と、終わっていればレビュー本文。`wait_seconds`(最大 120)だけ終わるのを待てる |
-| `list_reviews` | 最近のレビューと状態 |
-| `cancel_review` | 待ち・実行中のレビューを取り消す |
-| `list_pull_requests` | リポジトリの PR の一覧(レビューする PR を選ぶため) |
-| `server_status` | レビューサーバの状態(`review-server status`) |
+| `start_review` | Request a review of a PR and return a `run_id`. `model`, `queue`, `use_tools` (`--mcp`), `scope` and `new_job` can be set |
+| `get_review` | The state (queued / running / done / failed) and, if done, the review body. Can wait up to `wait_seconds` (max 120) for it to finish |
+| `list_reviews` | Recent reviews and their states |
+| `cancel_review` | Cancel a queued or running review |
+| `list_pull_requests` | List a repository's PRs (to pick one to review) |
+| `server_status` | Review server status (`review-server status`) |
 
-- 中では `review-pr --no-wait` を呼ぶだけなので、レビューサーバが動いていればそこに依頼する
-- PR へのコメントの投稿はしない。投稿は、呼び出した側が利用者に確かめてから `gh` で行う
-- レビューは 5〜10 分かかる。Claude Code が待ちきれずにツールがタイムアウトするときは、`wait_seconds` を小さくするか、
-  環境変数 `MCP_TOOL_TIMEOUT`(ミリ秒)を大きくする
+- Internally it just calls `review-pr --no-wait`, so the request goes to a review server if one is running
+- It does not post comments to the PR. To post, the caller confirms with the user and then uses `gh`
+- A review takes 5-10 minutes. If the tool times out in Claude Code, lower `wait_seconds`
+  or raise the `MCP_TOOL_TIMEOUT` environment variable (milliseconds)
 
-## モデルの選び方
+## Choosing a model
 
-PR #3(CI の変更、差分 99 行)で、指摘を差分と照らし合わせて比べた結果(2026-11-03、iEduq):
+Results of checking each model's findings against the diff of PR #3 (a CI change, 99-line diff) (2026-11-03, iEduq):
 
-| モデル | 正しい指摘 | 誤った指摘 | 時間 |
+| Model | Correct findings | Wrong findings | Time |
 |---|---|---|---|
-| qwen3-coder:30b | 0 | 2 | 19 秒 |
-| qwen3.8:27b-q8_0 | 3 | 0 | 243 秒 |
-| muse-glimmer:30b-q8_0 | 4 | 2 | 181 秒 |
-| **flint:40b**(既定) | **5** | **0** | 274 秒 |
-| ornith-1.5:35b | 5 | 1 | 412 秒 |
+| qwen3-coder:30b | 0 | 2 | 19 s |
+| qwen3.8:27b-q8_0 | 3 | 0 | 243 s |
+| muse-glimmer:30b-q8_0 | 4 | 2 | 181 s |
+| **flint:40b** (default) | **5** | **0** | 274 s |
+| ornith-1.5:35b | 5 | 1 | 412 s |
 
-PR 1 件だけでの比較なので、別の PR でも比べるとよい。同じ PR を別のモデルでレビューするには `-m` で指定する:
+This compares only one PR, so it is worth comparing on other PRs too. To review the same PR with another model, pass it with `-m`:
 
 ```bash
 ./review-pr -m qwen3.8:27b-q8_0 TechnoTUT/dmxctl 3
 ```
 
-## 制約と注意
+## Limitations and caveats
 
-- 差分は約 16 万文字で打ち切る(コンテキスト長 131072 トークン)。打ち切られた後ろのファイルはレビューされない
-- 考える過程は 1 回のリクエストで 8,000 トークンまで(`review.py` の `THINK_LIMIT`)。超えたら打ち切り、
-  それまでの考える過程を「検討メモ」として渡して、考える過程なしで本文を書かせる。
-  同じ指摘の見直しを繰り返して本文になかなか進まない(pbl-app-2026 #49 で 2 万トークン超)のを防ぐ
-- レビューは誤りを含むことがある。`--post` で投稿するときは、内容を確かめてから投稿する
-- gh の認証情報は窓口サーバでだけ使う(計算ノードには PR の情報と差分だけを渡す)
+- The diff is truncated at about 160,000 characters (context length 131072 tokens). Files after the cut are not reviewed
+- Thinking is limited to 8,000 tokens per request (`THINK_LIMIT` in `review.py`). Beyond that it is cut off,
+  the thinking so far is passed back as "review notes", and the model writes the body without thinking.
+  This stops it from re-examining the same findings over and over without getting to the body (over 20,000 tokens on pbl-app-2026 #49)
+- Reviews may contain mistakes. When posting with `--post`, check the content before posting
+- gh credentials are used only on the login server (compute nodes receive only the PR details and diff)
 
-## ファイル
+## Files
 
-| ファイル | 役割 |
+| File | Role |
 |---|---|
-| `review-pr` | CLI。PR の取得、ジョブの投入(またはサーバへの依頼)と待機、結果の表示と投稿 |
-| `review-server` / `jobs/server.pbs` | レビューサーバの起動・状態確認・停止 / 常駐ジョブ |
-| `jobs/server_common.sh` | サーバの一覧と生死の判定 |
-| `motd` | `review-pr` の起動時に表示するバナー(端末に出すときだけ) |
-| `jobs/ui.sh` | 色の設定と、対話用の入力・メニュー(`review-pr` と `review-server` で共通) |
-| `review.py` | Ollama にプロンプトを渡してレビューを得る(`--mcp-config` なしなら標準ライブラリのみ) |
-| `mcp_client.py` | MCP サーバにつなぎ、ツールを Ollama のツール呼び出しから使えるようにする |
-| `mcp_repo_server.py` | PR 適用後のリポジトリを読み取り専用で返す MCP サーバ |
-| `mcp_check_server.py` | Python(ruff)と HTML・Django テンプレートを静的に検査する MCP サーバ |
-| `mcp_docs_server.py` | Python・Django・HTML の公式資料を検索する MCP サーバ |
-| `mcp_scope.py` | `repo` と `check` が読める範囲(`--scope`)の判定 |
-| `fetch-docs` | `mcp_docs_server.py` が使う資料を取得する |
-| `review-mcp` / `mcp_review_server.py` | このレビュー CLI を、ほかの Claude Code から使う MCP サーバ |
-| `jobs/run_review.sh` | review.py の実行(mcp.json があれば uv の環境で MCP を使う) |
-| `jobs/review.pbs` | レビューのジョブ |
-| `jobs/ollama_env.sh` | Ollama の起動、モデルの取得、GPU への読み込みの確認 |
-| `jobs/qsub_common.sh` | キューに応じた qsub の引数(コンテナ・GPU 数・ノード) |
+| `review-pr` | The CLI. Fetches the PR, submits the job (or sends a request to the server) and waits, shows and posts the result |
+| `review-server` / `jobs/server.pbs` | Start, check and stop the review server / the resident job |
+| `jobs/server_common.sh` | Listing servers and checking whether they are alive |
+| `motd` | Banner shown when `review-pr` starts (only on a terminal) |
+| `jobs/ui.sh` | Color settings and interactive prompts and menus (shared by `review-pr` and `review-server`) |
+| `review.py` | Sends the prompt to Ollama and gets the review (standard library only without `--mcp-config`) |
+| `mcp_client.py` | Connects to MCP servers and makes their tools available to Ollama's tool calling |
+| `mcp_repo_server.py` | MCP server that serves the repository with the PR applied, read-only |
+| `mcp_check_server.py` | MCP server that statically checks Python (ruff) and HTML / Django templates |
+| `mcp_docs_server.py` | MCP server that searches the official Python, Django and HTML docs |
+| `mcp_scope.py` | Decides what `repo` and `check` may read (`--scope`) |
+| `fetch-docs` | Fetches the docs used by `mcp_docs_server.py` |
+| `review-mcp` / `mcp_review_server.py` | MCP server that lets other Claude Code sessions use this review CLI |
+| `jobs/run_review.sh` | Runs review.py (with MCP in the uv environment if mcp.json exists) |
+| `jobs/review.pbs` | The review job |
+| `jobs/ollama_env.sh` | Starting Ollama, pulling the model and confirming it is loaded onto the GPU |
+| `jobs/qsub_common.sh` | qsub arguments for each queue (container, GPU count, node) |
