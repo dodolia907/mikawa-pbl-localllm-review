@@ -80,6 +80,9 @@ review-pr                       (no arguments: choose everything interactively)
       --post           Post the review as a PR comment (asks for confirmation first)
       --no-wait        Exit right after submitting the job
       --quiet          Show only the status line, not the output while generating
+      --no-cache       Review every part again, even parts whose diff has not changed
+      --no-comments    Do not pass the PR's earlier comments and reviews to the model
+      --context        Put the code of the PR's base at the start of the prompt (see below)
       --new-job        Run in a new job even if a review server is running
       --server         Run on the review server (error if none is running)
       --start-server   Start a review server if none is running (up to 8 hours), wait for the model to load, then send the request
@@ -154,6 +157,45 @@ Deliberating… (2m 41s · ↓ 3.4k tokens · thinking · ctrl+c to cancel)
 
 - Each queue allows one running job per user. The two queues are separate, so you can run one job on iEduq and one on Eduq at the same time
 - If a job goes on hold (H), `review-pr` cancels it and exits. The node may be unhealthy, so pin another node with `-H`
+
+### Reusing part reviews (cache)
+
+When a PR is reviewed again after fixes, parts whose diff has not changed are not generated again:
+their earlier review is reused from `cache/` (on the shared `/work`), and only the changed parts and the
+merge step are generated. A part takes several minutes, so this saves most of the time of a re-review.
+
+- The key covers the part's diff and file list, the model, the tools and `--scope`, the thinking limit and
+  the version of `review.py` (a hash of its source). Any change to these, including the prompts, means a new review
+- The PR title, description and the files of other parts are not part of the key, so fixing one file does not
+  invalidate every part
+- Reused parts are shown as "Reused the review from the cache", and the run info at the top of `review.md`
+  says how many were reused (e.g. `cached: 2/4`)
+- `--no-cache` reviews everything again. Delete `cache/` to clear it
+
+### Earlier comments (re-reviews)
+
+The PR's comments and reviews so far (`gh pr view --json comments,reviews`, on the login server) are passed to the
+model, so a re-review does not repeat findings that were refuted or fixed in the replies.
+
+- They go to the merge step, not to the parts, so new comments do not invalidate the cached part reviews.
+  A PR with a single part gets them in its review
+- They are enclosed in `<pr-comments>` tags, and the model is told not to follow instructions inside them
+  (anyone can comment)
+- The newest come first, up to 30,000 characters; `--no-comments` leaves them out
+
+### Code of the base branch (--context)
+
+`--context` puts the code of the PR's base commit at the start of the prompt, so the model sees callers and
+definitions outside the diff without tool calls. Without it, a review split into parts reported a function as
+"never called" because its caller was in another part.
+
+- The source is downloaded once per commit into `cache/src/<repo>/<commit>/` (on the login server) and reused
+- Monorepos: only the `--scope` directories, or, without `--scope`, the directory the PR's files share
+  (e.g. `teams/invtechno`), plus shared settings at the top (`pyproject.toml`, `manage.py`, `*/settings.py`, `*/urls.py`)
+- The base versions of the files the PR changes come first, then the rest of the code, then documents,
+  up to 100,000 characters; files that do not fit are listed by name (the model can read them with tools)
+- The code goes right after the system prompt, before anything that differs between parts, so Ollama reuses
+  its computation for every part (and, on a review server, across PRs with the same base and changed files)
 
 ## Review server (keep the model loaded for consecutive reviews)
 
@@ -327,7 +369,7 @@ sequenceDiagram
 
 | Tool | What it does |
 |---|---|
-| `start_review` | Request a review of a PR and return a `run_id`. `model`, `queue`, `use_tools` (`--mcp`), `scope` and `new_job` can be set |
+| `start_review` | Request a review of a PR and return a `run_id`. `model`, `queue`, `use_tools` (`--mcp`), `scope` and `new_job` can be set; `start_server` starts a review server first if none is running, and `use_cache=false` reviews every part again; `use_context` adds `--context` and `use_comments=false` adds `--no-comments` |
 | `get_review` | The state (queued / running / done / failed) and, if done, the review body. Can wait up to `wait_seconds` (max 120) for it to finish |
 | `list_reviews` | Recent reviews and their states |
 | `cancel_review` | Cancel a queued or running review |
@@ -360,7 +402,7 @@ This compares only one PR, so it is worth comparing on other PRs too. To review 
 ## Limitations and caveats
 
 - The diff is truncated at about 160,000 characters (context length 131072 tokens). Files after the cut are not reviewed
-- Thinking is limited to 8,000 tokens per request (`THINK_LIMIT` in `review.py`). Beyond that it is cut off,
+- Thinking is limited to 3,000 tokens per request (`THINK_LIMIT` in `review.py`, or `review.py --think-limit`). Beyond that it is cut off,
   the thinking so far is passed back as "review notes", and the model writes the body without thinking.
   This stops it from re-examining the same findings over and over without getting to the body (over 20,000 tokens on pbl-app-2026 #49)
 - Reviews may contain mistakes. When posting with `--post`, check the content before posting
@@ -375,6 +417,7 @@ This compares only one PR, so it is worth comparing on other PRs too. To review 
 | `jobs/server_common.sh` | Listing servers and checking whether they are alive |
 | `motd` | Banner shown when `review-pr` starts (only on a terminal) |
 | `jobs/ui.sh` | Color settings and interactive prompts and menus (shared by `review-pr` and `review-server`) |
+| `cache/` | Reused part reviews (not in git) |
 | `review.py` | Sends the prompt to Ollama and gets the review (standard library only without `--mcp-config`) |
 | `mcp_client.py` | Connects to MCP servers and makes their tools available to Ollama's tool calling |
 | `mcp_repo_server.py` | MCP server that serves the repository with the PR applied, read-only |

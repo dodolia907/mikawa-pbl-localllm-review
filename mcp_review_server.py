@@ -119,7 +119,8 @@ def summary(d):
 
 @mcp.tool()
 def start_review(repo: str, pr_number: int, model: str = "", queue: str = "", use_tools: bool = False,
-                 scope: str = "", new_job: bool = False) -> str:
+                 scope: str = "", new_job: bool = False, start_server: bool = False,
+                 use_cache: bool = True, use_context: bool = False, use_comments: bool = True) -> str:
     """Start a review of a GitHub pull request on the HPC GPUs. Returns a run_id for get_review.
 
     repo: "owner/repo". pr_number: the PR number.
@@ -129,6 +130,14 @@ def start_review(repo: str, pr_number: int, model: str = "", queue: str = "", us
     (slower, often more accurate). scope: with use_tools, limit reading to this directory
     (e.g. "teams/invtechno" in a monorepo).
     new_job: always submit a new job even if a review server is running.
+    start_server: if no review server is running, start one (a resident GPU job of up to 8 hours that keeps
+    the model loaded) and send the review to it; later reviews then skip queueing and model loading.
+    Starting takes 1-3 minutes. Use it when several reviews are coming.
+    use_cache: reuse earlier reviews of parts whose diff has not changed (default true).
+    use_context: put the code of the PR's base (the scope directory, or the directory the PR touches) at the start
+    of the prompt, so the model sees callers and definitions outside the diff.
+    use_comments: pass the PR's earlier comments and reviews, so findings already refuted or fixed are not repeated
+    (default true).
     """
     if not REPO_RE.match(repo):
         raise ToolError("repo must look like owner/repo")
@@ -149,8 +158,18 @@ def start_review(repo: str, pr_number: int, model: str = "", queue: str = "", us
         if not NAME_RE.match(scope) or ".." in scope:
             raise ToolError(f"invalid scope: {scope}")
         cmd += ["--scope", scope]
+    if new_job and start_server:
+        raise ToolError("new_job and start_server cannot be used together")
     if new_job:
         cmd.append("--new-job")
+    if start_server:
+        cmd.append("--start-server")
+    if not use_cache:
+        cmd.append("--no-cache")
+    if use_context:
+        cmd.append("--context")
+    if not use_comments:
+        cmd.append("--no-comments")
     cmd += [repo, str(pr_number)]
     code, out, err = run(cmd, timeout=600)    # --mcp ではソースと uv の環境を用意するので時間がかかる
     m = re.search(r"Output: (\S+)", err)

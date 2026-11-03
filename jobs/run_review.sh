@@ -19,6 +19,15 @@ run_review() {
   local url=$1 model=$2 run=$3
   local args=(--host "$url" --model "$model" --pr-json "$run/pr.json" --diff "$run/pr.diff"
               --out "$run/review.md" --stream "$run/stream.txt")
+  # 入力の変わっていないパートのレビューを使い回す(review-pr --no-cache なら使わない)
+  [ -e "$run/no-cache" ] || args+=(--cache-dir "$ROOT/cache")
+  # これまでのコメント(review-pr が取得したもの)
+  [ -s "$run/pr-comments.json" ] && args+=(--comments "$run/pr-comments.json")
+  # review-pr --context: ベースのソース(1 行目)、範囲(2 行目、空なら自動)、名前(3 行目)
+  if [ -s "$run/context" ]; then
+    local ctx=() ; mapfile -t ctx < "$run/context"
+    args+=(--context-dir "${ctx[0]}" --context-scope "${ctx[1]:-}" --context-label "${ctx[2]:-base}")
+  fi
   if [ -f "$run/mcp.json" ]; then
     echo "Using MCP tools ($run/mcp.json)"
     RUN_DIR=$run ROOT=$ROOT UV_PYTHON_DOWNLOADS=never \
