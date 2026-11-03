@@ -11,6 +11,7 @@
 付けなければ標準ライブラリだけで動く。
 """
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -477,11 +478,74 @@ def ask(host, model, system, user, stream, title, part="-", total=0, tools=None,
     return text, res
 
 
-def review(host, model, pr, diff, stream=None, tools=None):
+class ReviewCache:
+    """パートごとのレビュー(とまとめ)を、入力が同じなら使い回すためのキャッシュ。
+
+    直してからレビューし直すとき、差分の変わっていないパートを生成し直さずに済む(1 パートで数分かかる)。
+    キーには、パートの差分とファイルの一覧のほか、モデル・ツールの設定・考える過程の上限・この review.py の版
+    (ソースのハッシュ)を入れる。プロンプトや設定が変われば、キーも変わって使い回さない。
+    PR の題名や説明、ほかのパートのファイルの一覧は入れない(1 ファイル直しただけで全部が外れないように)。
+    1 件 1 ファイル(<dir>/<キーの先頭 2 文字>/<キー>.json)。dir が None なら何もしない。
+    """
+    CODE_VERSION = hashlib.sha256(open(__file__, "rb").read()).hexdigest()[:12]
+
+    def __init__(self, path=None):
+        self.path = path
+        self.hits = 0
+
+    def key(self, *items):
+        data = json.dumps([self.CODE_VERSION, *items], ensure_ascii=False, sort_keys=True)
+        return hashlib.sha256(data.encode()).hexdigest()
+
+    def _file(self, key):
+        return os.path.join(self.path, key[:2], key + ".json")
+
+    def get(self, key):
+        """(本文, レビューした時刻)。なければ None。"""
+        if not self.path:
+            return None
+        try:
+            with open(self._file(key), encoding="utf-8") as f:
+                entry = json.load(f)
+        except (OSError, ValueError):
+            return None
+        self.hits += 1
+        return entry["text"], entry.get("created", "")
+
+    def put(self, key, text):
+        if not self.path or not text:
+            return
+        p = self._file(key)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        tmp = f"{p}.{os.getpid()}.tmp"           # 読む側が書きかけを見ないよう、置き換えで書く
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"text": text, "created": time.strftime("%Y-%m-%d %H:%M")}, f, ensure_ascii=False)
+        os.replace(tmp, p)
+
+
+def ask_cached(cache, key, host, model, system, user, stream, title, part="-", total=0, tools=None, paths=()):
+    """キャッシュにあれば使い回し、なければ ask してキャッシュに入れる。戻り値: (本文, 応答)"""
+    hit = cache.get(key)
+    if hit:
+        text, created = hit
+        stream.begin(title, part, total)
+        stream.note(f"=== Reused the review from the cache (reviewed {created}) ===\n")
+        stream.write("content", text)
+        return text, {}
+    text, res = ask(host, model, system, user, stream, title, part, total, tools, paths)
+    cache.put(key, text)
+    return text, res
+
+
+def review(host, model, pr, diff, stream=None, tools=None, cache=None):
     """PR をレビューする。戻り値: (レビュー本文, 実行情報の HTML コメント, パートごとのレビュー or None)"""
     stream = stream or StreamWriter()
+    cache = cache or ReviewCache()
     files = pr.get("files", [])
     parts = make_parts(diff)
+    # キャッシュのキーに入れる設定(ツールの組み合わせと読める範囲、考える過程の上限)
+    setting = {"model": model, "think_limit": THINK_LIMIT,
+               "tools": sorted(tools.tools) if tools else None, "scope": tools.scope if tools else None}
     t0, prompt_tokens, output_tokens, tool_calls, rejected = time.time(), 0, 0, 0, 0
 
     def tally(res):
@@ -492,9 +556,10 @@ def review(host, model, pr, diff, stream=None, tools=None):
         rejected += res.get("tool_calls_rejected") or 0
 
     if len(parts) == 1:
-        text, res = ask(host, model, SYSTEM, build_prompt(pr, files, diff), stream,
-                        f"Reviewing the diff ({len(diff):,} chars)", tools=tools,
-                        paths=[f["path"] for f in files])
+        paths = [f["path"] for f in files]
+        text, res = ask_cached(cache, cache.key("part", setting, paths, diff), host, model, SYSTEM,
+                               build_prompt(pr, files, diff), stream,
+                               f"Reviewing the diff ({len(diff):,} chars)", tools=tools, paths=paths)
         tally(res)
         part_reviews = None
     else:
@@ -506,21 +571,23 @@ def review(host, model, pr, diff, stream=None, tools=None):
                     f"この PR は大きいため、ファイルごとに {n} 個のパートに分けてレビューしています。これはパート {i}/{n} です。\n"
                     f"下の差分({', '.join(paths)})だけをレビューしてください。ほかのファイルは別のパートでレビューします。\n"
                     f"「概要」には、このパートの変更について書いてください。\n\n")
-            text, res = ask(host, model, SYSTEM, build_prompt(pr, files, part_diff, note), stream,
-                            f"Part {i}/{n}: {shown} ({len(part_diff):,} chars)", i, n, tools, paths)
+            text, res = ask_cached(cache, cache.key("part", setting, paths, part_diff), host, model, SYSTEM,
+                                   build_prompt(pr, files, part_diff, note), stream,
+                                   f"Part {i}/{n}: {shown} ({len(part_diff):,} chars)", i, n, tools, paths)
             tally(res)
             part_reviews.append((paths, text))
         merged_input = pr_header(pr, files) + "## 各パートのレビュー\n\n" + "\n\n".join(
             f"### パート {i}/{n}({', '.join(paths)})\n\n{t}" for i, (paths, t) in enumerate(part_reviews, 1))
-        text, res = ask(host, model, SYSTEM_MERGE, merged_input, stream,
-                        f"Merging {n} part reviews", "merge", n)
+        text, res = ask_cached(cache, cache.key("merge", setting, merged_input), host, model, SYSTEM_MERGE,
+                               merged_input, stream, f"Merging {n} part reviews", "merge", n)
         tally(res)
     stream.finish()
     meta = (f"<!-- model: {model}, {time.time() - t0:.0f}s, "
             f"prompt_tokens: {prompt_tokens}, output_tokens: {output_tokens}"
             f"{f', parts: {len(parts)}' if len(parts) > 1 else ''}"
             f"{f', tool_calls: {tool_calls}' if tools else ''}"
-            f"{f' (rejected: {rejected})' if rejected else ''} -->")
+            f"{f' (rejected: {rejected})' if rejected else ''}"
+            f"{f', cached: {cache.hits}/{len(parts) + (len(parts) > 1)}' if cache.hits else ''} -->")
     return text, meta, part_reviews
 
 
@@ -533,6 +600,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--stream", help="file to append the output to while it is generated")
     ap.add_argument("--mcp-config", help="MCP servers whose tools the model may call (.mcp.json format)")
+    ap.add_argument("--cache-dir", help="reuse part reviews whose input has not changed (see ReviewCache)")
     ap.add_argument("--think-limit", type=int, default=THINK_LIMIT,
                     help=f"thinking tokens per request before writing from the notes (default {THINK_LIMIT})")
     args = ap.parse_args()
@@ -549,7 +617,8 @@ def main():
         tools = MCPTools(args.mcp_config)
     try:
         text, meta, part_reviews = review(args.host, args.model, pr, diff,
-                                          StreamWriter(args.stream) if args.stream else None, tools)
+                                          StreamWriter(args.stream) if args.stream else None, tools,
+                                          ReviewCache(args.cache_dir))
     finally:
         if tools:
             tools.close()

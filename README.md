@@ -80,6 +80,7 @@ review-pr                       (no arguments: choose everything interactively)
       --post           Post the review as a PR comment (asks for confirmation first)
       --no-wait        Exit right after submitting the job
       --quiet          Show only the status line, not the output while generating
+      --no-cache       Review every part again, even parts whose diff has not changed
       --new-job        Run in a new job even if a review server is running
       --server         Run on the review server (error if none is running)
       --start-server   Start a review server if none is running (up to 8 hours), wait for the model to load, then send the request
@@ -154,6 +155,20 @@ Deliberating… (2m 41s · ↓ 3.4k tokens · thinking · ctrl+c to cancel)
 
 - Each queue allows one running job per user. The two queues are separate, so you can run one job on iEduq and one on Eduq at the same time
 - If a job goes on hold (H), `review-pr` cancels it and exits. The node may be unhealthy, so pin another node with `-H`
+
+### Reusing part reviews (cache)
+
+When a PR is reviewed again after fixes, parts whose diff has not changed are not generated again:
+their earlier review is reused from `cache/` (on the shared `/work`), and only the changed parts and the
+merge step are generated. A part takes several minutes, so this saves most of the time of a re-review.
+
+- The key covers the part's diff and file list, the model, the tools and `--scope`, the thinking limit and
+  the version of `review.py` (a hash of its source). Any change to these, including the prompts, means a new review
+- The PR title, description and the files of other parts are not part of the key, so fixing one file does not
+  invalidate every part
+- Reused parts are shown as "Reused the review from the cache", and the run info at the top of `review.md`
+  says how many were reused (e.g. `cached: 2/4`)
+- `--no-cache` reviews everything again. Delete `cache/` to clear it
 
 ## Review server (keep the model loaded for consecutive reviews)
 
@@ -375,6 +390,7 @@ This compares only one PR, so it is worth comparing on other PRs too. To review 
 | `jobs/server_common.sh` | Listing servers and checking whether they are alive |
 | `motd` | Banner shown when `review-pr` starts (only on a terminal) |
 | `jobs/ui.sh` | Color settings and interactive prompts and menus (shared by `review-pr` and `review-server`) |
+| `cache/` | Reused part reviews (not in git) |
 | `review.py` | Sends the prompt to Ollama and gets the review (standard library only without `--mcp-config`) |
 | `mcp_client.py` | Connects to MCP servers and makes their tools available to Ollama's tool calling |
 | `mcp_repo_server.py` | MCP server that serves the repository with the PR applied, read-only |

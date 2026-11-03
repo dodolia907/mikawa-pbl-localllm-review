@@ -25,6 +25,7 @@ Options:
       --post           Post the review as a PR comment (asks for confirmation first)
       --no-wait        Submit the job and exit without waiting
       --quiet          Do not stream the model's output; show progress only
+      --no-cache       Review every part again, even if an unchanged part was reviewed before
       --think-lines N  Show the model's thinking in a fixed box of N lines above the status line
                        (default 5; 0 hides it). The review itself still scrolls normally
       --new-job        Always submit a new job, even if a review server is running
@@ -47,7 +48,7 @@ die() { echo "review-pr: $*" >&2; exit 1; }
 
 ROOT=$(cd "$(dirname "$(realpath "$0")")" && pwd)
 MODEL=flint:40b
-OUTPUT= POST=0 MCP=0 SCOPE= WAIT=1 THINK_ROWS=5 INTERACTIVE=0 QUIET=0 NEW_JOB=0 REQUIRE_SERVER=0 START_SERVER=0 SERVER_DIR=
+OUTPUT= POST=0 MCP=0 SCOPE= WAIT=1 THINK_ROWS=5 NO_CACHE=0 INTERACTIVE=0 QUIET=0 NEW_JOB=0 REQUIRE_SERVER=0 START_SERVER=0 SERVER_DIR=
 REPO= PR=
 ARGS=()
 while (( $# )); do
@@ -63,6 +64,7 @@ while (( $# )); do
     --scope)     SCOPE=${2:?}; MCP=1; shift 2 ;;
     --no-wait)   WAIT=0; shift ;;
     --quiet)     QUIET=1; shift ;;
+    --no-cache)  NO_CACHE=1; shift ;;
     --think-lines) THINK_ROWS=${2:?}; [[ $THINK_ROWS =~ ^[0-9]+$ ]] || die "--think-lines needs a number"; shift 2 ;;
     --new-job)   NEW_JOB=1; shift ;;
     --server)    REQUIRE_SERVER=1; shift ;;
@@ -205,6 +207,7 @@ interactive() {
   (( POST )) && cmd+=" --post"
   (( WAIT )) || cmd+=" --no-wait"
   [ "$THINK_ROWS" != 5 ] && cmd+=" --think-lines $THINK_ROWS"
+  (( NO_CACHE )) && cmd+=" --no-cache"
   cmd+=" $REPO $PR"
   echo >&2; echo "Equivalent command: $cmd" >&2
   menu sel "Run it?" yes $'yes\tRun' $'no\tCancel'
@@ -220,6 +223,7 @@ mkdir -p "$RUN"
 gh pr view "$PR" -R "$REPO" --json number,title,body,author,baseRefName,headRefName,headRefOid,files,additions,deletions \
   > "$RUN/pr.json" || { rm -rf "$RUN"; die "cannot fetch pull request $REPO#$PR"; }
 gh pr diff "$PR" -R "$REPO" > "$RUN/pr.diff"
+(( NO_CACHE )) && touch "$RUN/no-cache"     # ジョブ(jobs/run_review.sh)はこれを見て、キャッシュを使わない
 TITLE=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["title"])' "$RUN/pr.json")
 echo "${BOLD}$REPO#$PR${RESET} $TITLE ${DIM}($(wc -l < "$RUN/pr.diff") diff lines)${RESET}" >&2
 # 大きな PR はファイルごとのパートに分けてレビューする(分け方は review.py と同じ関数で数える)
