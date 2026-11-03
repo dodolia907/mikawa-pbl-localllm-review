@@ -26,6 +26,9 @@ Options:
       --no-wait        Submit the job and exit without waiting
       --quiet          Do not stream the model's output; show progress only
       --no-cache       Review every part again, even if an unchanged part was reviewed before
+      --no-comments    Do not pass the PR's earlier comments and reviews to the model
+      --context        Put the code of the PR's base at the start of the prompt (the --scope directory,
+                       or the directory the PR touches); cached per commit, so reviews of the same repo reuse it
       --think-lines N  Show the model's thinking in a fixed box of N lines above the status line
                        (default 5; 0 hides it). The review itself still scrolls normally
       --new-job        Always submit a new job, even if a review server is running
@@ -48,7 +51,7 @@ die() { echo "review-pr: $*" >&2; exit 1; }
 
 ROOT=$(cd "$(dirname "$(realpath "$0")")" && pwd)
 MODEL=flint:40b
-OUTPUT= POST=0 MCP=0 SCOPE= WAIT=1 THINK_ROWS=5 NO_CACHE=0 INTERACTIVE=0 QUIET=0 NEW_JOB=0 REQUIRE_SERVER=0 START_SERVER=0 SERVER_DIR=
+OUTPUT= POST=0 MCP=0 SCOPE= WAIT=1 THINK_ROWS=5 NO_CACHE=0 NO_COMMENTS=0 CONTEXT=0 INTERACTIVE=0 QUIET=0 NEW_JOB=0 REQUIRE_SERVER=0 START_SERVER=0 SERVER_DIR=
 REPO= PR=
 ARGS=()
 while (( $# )); do
@@ -65,6 +68,8 @@ while (( $# )); do
     --no-wait)   WAIT=0; shift ;;
     --quiet)     QUIET=1; shift ;;
     --no-cache)  NO_CACHE=1; shift ;;
+    --no-comments) NO_COMMENTS=1; shift ;;
+    --context)   CONTEXT=1; shift ;;
     --think-lines) THINK_ROWS=${2:?}; [[ $THINK_ROWS =~ ^[0-9]+$ ]] || die "--think-lines needs a number"; shift 2 ;;
     --new-job)   NEW_JOB=1; shift ;;
     --server)    REQUIRE_SERVER=1; shift ;;
@@ -208,6 +213,8 @@ interactive() {
   (( WAIT )) || cmd+=" --no-wait"
   [ "$THINK_ROWS" != 5 ] && cmd+=" --think-lines $THINK_ROWS"
   (( NO_CACHE )) && cmd+=" --no-cache"
+  (( NO_COMMENTS )) && cmd+=" --no-comments"
+  (( CONTEXT )) && cmd+=" --context"
   cmd+=" $REPO $PR"
   echo >&2; echo "Equivalent command: $cmd" >&2
   menu sel "Run it?" yes $'yes\tRun' $'no\tCancel'
@@ -220,10 +227,15 @@ interactive() {
 
 RUN="$ROOT/runs/${REPO//\//_}/pr${PR}-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$RUN"
-gh pr view "$PR" -R "$REPO" --json number,title,body,author,baseRefName,headRefName,headRefOid,files,additions,deletions \
+gh pr view "$PR" -R "$REPO" --json number,title,body,author,baseRefName,baseRefOid,headRefName,headRefOid,files,additions,deletions \
   > "$RUN/pr.json" || { rm -rf "$RUN"; die "cannot fetch pull request $REPO#$PR"; }
 gh pr diff "$PR" -R "$REPO" > "$RUN/pr.diff"
 (( NO_CACHE )) && touch "$RUN/no-cache"     # ジョブ(jobs/run_review.sh)はこれを見て、キャッシュを使わない
+# これまでのコメントとレビュー(レビューし直すとき、対応済みや誤りと確認された指摘を繰り返さないため)
+if (( !NO_COMMENTS )); then
+  gh pr view "$PR" -R "$REPO" --json comments,reviews > "$RUN/pr-comments.json" 2>/dev/null \
+    || rm -f "$RUN/pr-comments.json"
+fi
 TITLE=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["title"])' "$RUN/pr.json")
 echo "${BOLD}$REPO#$PR${RESET} $TITLE ${DIM}($(wc -l < "$RUN/pr.diff") diff lines)${RESET}" >&2
 # 大きな PR はファイルごとのパートに分けてレビューする(分け方は review.py と同じ関数で数える)
@@ -233,6 +245,22 @@ print(len(review.make_parts(open(sys.argv[1], encoding="utf-8", errors="replace"
 
 # --mcp: PR 適用後のソースを窓口サーバで取得し(gh のトークンは計算ノードに渡さない)、
 # モデルがツールで読めるよう、MCP サーバの設定(mcp.json)を実行ディレクトリに置く
+# --context: PR のベース(base)の時点のソースを、プロンプトの先頭に載せる。ソースはコミットごとに
+# cache/src/ に取っておき、同じコミットなら取得し直さない(gh のトークンは計算ノードに渡さない)
+if (( CONTEXT )); then
+  BASE_SHA=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["baseRefOid"])' "$RUN/pr.json")
+  CTX="$ROOT/cache/src/${REPO//\//_}/$BASE_SHA"
+  if [ ! -d "$CTX" ]; then
+    mkdir -p "$CTX.tmp.$$"
+    gh api "repos/$REPO/tarball/$BASE_SHA" | tar -xz -C "$CTX.tmp.$$" --strip-components=1 \
+      && mv "$CTX.tmp.$$" "$CTX" \
+      || { rm -rf "$CTX.tmp.$$" "$RUN"; die "cannot download the base source of $REPO@${BASE_SHA:0:7}"; }
+  fi
+  # ジョブ(jobs/run_review.sh)に渡す: ソースの場所、範囲(--scope。空なら変更されたファイルから決める)、名前
+  printf '%s\n%s\n%s\n' "$CTX" "$SCOPE" "$REPO@${BASE_SHA:0:7}" > "$RUN/context"
+  echo "${DIM}Code context: $REPO@${BASE_SHA:0:7} (base)${SCOPE:+, $SCOPE}${RESET}" >&2
+fi
+
 if (( MCP )); then
   . "$ROOT/jobs/run_review.sh"
   [ -x "$UV" ] || { rm -rf "$RUN"; die "--mcp needs uv ($UV)"; }
