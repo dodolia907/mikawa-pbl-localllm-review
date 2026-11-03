@@ -342,7 +342,7 @@ sequenceDiagram
 
 | Tool | What it does |
 |---|---|
-| `start_review` | Request a review of a PR and return a `run_id`. `model`, `queue`, `use_tools` (`--mcp`), `scope` and `new_job` can be set |
+| `start_review` | Request a review of a PR and return a `run_id`. `model`, `queue`, `use_tools` (`--mcp`), `scope` and `new_job` can be set; `start_server` starts a review server first if none is running, and `use_cache=false` reviews every part again |
 | `get_review` | The state (queued / running / done / failed) and, if done, the review body. Can wait up to `wait_seconds` (max 120) for it to finish |
 | `list_reviews` | Recent reviews and their states |
 | `cancel_review` | Cancel a queued or running review |
