@@ -10,14 +10,24 @@
 
 ## 仕組み
 
-```
-review-pr(窓口サーバ ydev)
-  ├ gh で PR の情報と差分を取得(GitHub のトークンは計算ノードに渡さない)
-  ├ qsub で jobs/review.pbs を投入 ─→ GPU ノード(iEduq: A100 / Eduq: MI210)
-  │                                    ├ Ollama を起動し、モデルを用意して GPU に読み込む
-  │                                    └ review.py: 差分を渡してレビューを得る
-  ├ ジョブが終わるまで進み具合を表示(Ctrl-C でジョブも取り消す)
-  └ レビューを表示(--post なら確認のうえ PR にコメント)
+```mermaid
+sequenceDiagram
+  participant U as 利用者
+  participant C as review-pr<br/>(窓口サーバ ydev)
+  participant G as GitHub
+  participant J as ジョブ<br/>(GPU ノード iEduq A100 / Eduq MI210)
+  U->>C: review-pr owner/repo 番号
+  C->>G: gh で PR の情報と差分を取得
+  Note over C,J: GitHub のトークンは計算ノードに渡さない
+  C->>J: qsub で jobs/review.pbs を投入
+  J->>J: Ollama を起動し、モデルを用意して GPU に読み込む
+  J->>J: review.py で差分を渡してレビューを得る
+  J-->>C: stream.txt と review.md(共有の /work)
+  C-->>U: 終わるまで進み具合を表示(Ctrl-C でジョブも取り消す)
+  C-->>U: レビューを表示
+  opt --post
+    C->>G: 確認のうえ PR にコメント
+  end
 ```
 
 結果は `runs/<owner>_<repo>/pr<番号>-<日時>/` に残る。
@@ -196,15 +206,31 @@ Python・HTML・Django テンプレートを検査したり、使っている版
 ./review-pr --mcp TechnoTUT/dmxctl 3
 ```
 
+```mermaid
+flowchart TB
+  subgraph ydev["窓口サーバ(review-pr)"]
+    A["gh api で PR の head のソース(tarball)を取得<br/>runs/.../src/"]
+    B["MCP サーバの設定を書く<br/>runs/.../mcp.json"]
+    A --> B
+  end
+  subgraph node["ジョブ(GPU ノード)"]
+    R["review.py<br/>uv の Python 3.12 + mcp SDK"]
+    O["Ollama"]
+    subgraph mcp["MCP サーバ(stdio で起動、読み取り専用)"]
+      S1["repo<br/>read_file / search / list_files"]
+      S2["check<br/>check_python / check_template"]
+      S3["docs<br/>search_docs / read_doc"]
+    end
+    R -- "差分とツールの一覧" --> O
+    O -- "ツールの呼び出し" --> R
+    R -- "ツールを実行" --> mcp
+    mcp -- "結果" --> R
+  end
+  B --> R
+  D[("資料<br/>/work/$USER/llm/docs")] -.-> S3
 ```
-review-pr(窓口サーバ)
-  ├ gh api で PR の head のソース(tarball)を取得 → runs/.../src/
-  ├ MCP サーバの設定を runs/.../mcp.json に書く
-  └ ジョブ(GPU ノード)
-       review.py(uv の Python 3.12 + mcp SDK)
-         ├ MCP サーバ(repo / check / docs)を起動(stdio)し、ツールの一覧を Ollama の tools に渡す
-         └ モデルがツールを呼ぶ → MCP サーバで実行 → 結果を返す、を答えが出るまで繰り返す
-```
+
+モデルがツールを呼ぶたびに review.py が MCP サーバで実行して結果を返し、答えが出るまで繰り返す。
 
 - どのツールも読み取り専用で、`src/`(と資料)の外は読めない
 - 1 パートあたり最大 12 回まで呼べる(結果の末尾に残りの回数を添える)。超えたらツールなしで書かせる。
