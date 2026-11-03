@@ -56,6 +56,11 @@ MAX_TOOL_CALLS = 12
 # プロンプトで「リポジトリの文書を読み回らない」と伝えても守られず、#49 では 12 回のうち 7 回を
 # チームの文書(README・todo・requirements など)に使い、資料で確かめる回数が足りなくなった。
 MAX_REPO_CALLS = 6
+# repo__* を上限の後も呼んで断られた応答が、これだけ続いたらツールを打ち切る。断った呼び出しは合計に数えない。
+# 合計に数えていたときは、モデルが一覧から外れた repo__* を 1 回の応答で 3 回まとめて呼び、12 回のうち 3 回が
+# 無駄になった(pbl-app-2026 #49、このリポジトリ自身の PR #1 のどのパートでも)。その次の応答では docs__* や
+# check__* に移っていたので、1 回の応答で断られただけでは打ち切らない
+MAX_REJECTED_ROUNDS = 2
 
 
 def repo_limit(tools):
@@ -364,12 +369,14 @@ def chat(host, model, system, user, stream, think=None, tools=None, timeout=3600
 
     tools(mcp_client.MCPTools)があれば、モデルがツールを呼ぶたびに実行して結果を返し、答えが出るまで続ける。
     呼び出しが MAX_TOOL_CALLS を超えたら、ツールなしで答えさせる。repo__* が repo_limit に達したら、
-    repo__* をツールの一覧から外す(それでも呼ばれたら実行せずに断る)。
+    repo__* をツールの一覧から外す。それでも呼ばれたら実行せずに断り(合計には数えない)、
+    断られた応答が MAX_REJECTED_ROUNDS 回続いたら、ツールを打ち切って答えさせる。
     戻り値は最後の応答。トークン数は全リクエストの合計にする。
     """
     messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
     schemas = tools.schemas if tools else None
-    n_calls, repo_calls, prompt_tokens, output_tokens = 0, 0, 0, 0
+    n_calls, repo_calls, n_rejected, prompt_tokens, output_tokens = 0, 0, 0, 0, 0
+    rejected_rounds = 0                       # 断った呼び出しを含む応答が続いた数
     max_repo = repo_limit(tools) if tools else 0
     while True:
         res = chat_once(host, messages, model, stream, schemas, think, timeout)
@@ -389,15 +396,17 @@ def chat(host, model, system, user, stream, think=None, tools=None, timeout=3600
         if not calls or not schemas:
             break
         messages.append(res["message"])
+        rejected_before = n_rejected
         for c in calls:
             fn = c.get("function", {})
             name, args = fn.get("name", ""), fn.get("arguments") or {}
-            n_calls += 1
             if name.startswith("repo__") and repo_calls >= max_repo:
-                # 断った呼び出しも合計に数える(呼び続けても終わるように)
+                # 断った呼び出しは合計に数えない。次の応答でも続けば打ち切る
+                n_rejected += 1
                 result = (f"error: repo__* は上限の {max_repo} 回に達したので実行しなかった。"
                           "リポジトリはもう読めない。必要なら docs__* や check__* を使うか、レビューを書くこと。")
             else:
+                n_calls += 1
                 repo_calls += name.startswith("repo__")
                 result = tools.call(name, args)
             left = MAX_TOOL_CALLS - n_calls
@@ -413,14 +422,20 @@ def chat(host, model, system, user, stream, think=None, tools=None, timeout=3600
         if schemas and repo_calls >= max_repo:
             # repo__* を一覧から外す。ほかのツールが残っていなければ、ツールなしで書かせる
             schemas = [s for s in schemas if not s["function"]["name"].startswith("repo__")] or None
-        if n_calls >= MAX_TOOL_CALLS or not schemas:
+        rejected_rounds = rejected_rounds + 1 if n_rejected > rejected_before else 0
+        if rejected_rounds >= MAX_REJECTED_ROUNDS:
+            # 「上限に達した」と伝えても repo__* を呼び続けるので、これ以上は待たない
+            schemas = None
+            messages.append({"role": "user", "content": "使えないツールを呼び続けたため、ツールを打ち切りました。"
+                             "これ以上ツールは使えないので、ここまでの情報でレビューを書いてください。"})
+        elif n_calls >= MAX_TOOL_CALLS or not schemas:
             # これ以上は呼ばせず、集めた情報で書かせる
             schemas = None
             messages.append({"role": "user", "content": "ツールの呼び出し回数の上限に達しました。"
                              "これ以上ツールは使えないので、ここまでの情報でレビューを書いてください。"})
         stream.round()
     res["prompt_eval_count"], res["eval_count"] = prompt_tokens, output_tokens
-    res["tool_calls_total"] = n_calls
+    res["tool_calls_total"], res["tool_calls_rejected"] = n_calls, n_rejected
     return res
 
 
@@ -449,13 +464,14 @@ def review(host, model, pr, diff, stream=None, tools=None):
     stream = stream or StreamWriter()
     files = pr.get("files", [])
     parts = make_parts(diff)
-    t0, prompt_tokens, output_tokens, tool_calls = time.time(), 0, 0, 0
+    t0, prompt_tokens, output_tokens, tool_calls, rejected = time.time(), 0, 0, 0, 0
 
     def tally(res):
-        nonlocal prompt_tokens, output_tokens, tool_calls
+        nonlocal prompt_tokens, output_tokens, tool_calls, rejected
         prompt_tokens += res.get("prompt_eval_count") or 0
         output_tokens += res.get("eval_count") or 0
         tool_calls += res.get("tool_calls_total") or 0
+        rejected += res.get("tool_calls_rejected") or 0
 
     if len(parts) == 1:
         text, res = ask(host, model, SYSTEM, build_prompt(pr, files, diff), stream,
@@ -485,7 +501,8 @@ def review(host, model, pr, diff, stream=None, tools=None):
     meta = (f"<!-- model: {model}, {time.time() - t0:.0f}s, "
             f"prompt_tokens: {prompt_tokens}, output_tokens: {output_tokens}"
             f"{f', parts: {len(parts)}' if len(parts) > 1 else ''}"
-            f"{f', tool_calls: {tool_calls}' if tools else ''} -->")
+            f"{f', tool_calls: {tool_calls}' if tools else ''}"
+            f"{f' (rejected: {rejected})' if rejected else ''} -->")
     return text, meta, part_reviews
 
 

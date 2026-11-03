@@ -249,6 +249,8 @@ Each time the model calls a tool, review.py runs it on the MCP server and return
 - Up to 12 calls per part (the number left is appended to each result). After that the model must write without tools.
   Of those, the `repo__*` tools that read the repository are limited to 6 (when `check` and `docs` are also available; `MAX_REPO_CALLS` in `review.py`).
   Once used up, `repo__*` is removed from the tool list, and calls that still come in are refused without running.
+  Refused calls do not count toward the 12, so they do not eat into the calls left for `check` and `docs`;
+  if two responses in a row contain refused calls, the tools are cut off and the model writes the review.
   Only telling it "don't wander around reading" in the prompt left it reading the team's documents one after another, with no calls left to check the docs.
   Each tool call is shown on screen as one dim line
 - The prompt names the folder common to the changed files (e.g. `teams/invtechno`) and tells the model not to wander through other folders.
