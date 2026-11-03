@@ -25,6 +25,8 @@ Options:
       --post           Post the review as a PR comment (asks for confirmation first)
       --no-wait        Submit the job and exit without waiting
       --quiet          Do not stream the model's output; show progress only
+      --think-lines N  Show the model's thinking in a fixed box of N lines above the status line
+                       (default 5; 0 hides it). The review itself still scrolls normally
       --new-job        Always submit a new job, even if a review server is running
       --server         Require a running review server (see review-server)
       --start-server   Start a review server (up to 8h) if none is running, then send the review to it
@@ -45,7 +47,7 @@ die() { echo "review-pr: $*" >&2; exit 1; }
 
 ROOT=$(cd "$(dirname "$(realpath "$0")")" && pwd)
 MODEL=flint:40b
-OUTPUT= POST=0 MCP=0 SCOPE= WAIT=1 INTERACTIVE=0 QUIET=0 NEW_JOB=0 REQUIRE_SERVER=0 START_SERVER=0 SERVER_DIR=
+OUTPUT= POST=0 MCP=0 SCOPE= WAIT=1 THINK_ROWS=5 INTERACTIVE=0 QUIET=0 NEW_JOB=0 REQUIRE_SERVER=0 START_SERVER=0 SERVER_DIR=
 REPO= PR=
 ARGS=()
 while (( $# )); do
@@ -61,6 +63,7 @@ while (( $# )); do
     --scope)     SCOPE=${2:?}; MCP=1; shift 2 ;;
     --no-wait)   WAIT=0; shift ;;
     --quiet)     QUIET=1; shift ;;
+    --think-lines) THINK_ROWS=${2:?}; [[ $THINK_ROWS =~ ^[0-9]+$ ]] || die "--think-lines needs a number"; shift 2 ;;
     --new-job)   NEW_JOB=1; shift ;;
     --server)    REQUIRE_SERVER=1; shift ;;
     --start-server) START_SERVER=1; shift ;;
@@ -201,6 +204,7 @@ interactive() {
   [ -n "$SCOPE" ] && cmd+=" --scope $SCOPE"
   (( POST )) && cmd+=" --post"
   (( WAIT )) || cmd+=" --no-wait"
+  [ "$THINK_ROWS" != 5 ] && cmd+=" --think-lines $THINK_ROWS"
   cmd+=" $REPO $PR"
   echo >&2; echo "Equivalent command: $cmd" >&2
   menu sel "Run it?" yes $'yes\tRun' $'no\tCancel'
@@ -357,7 +361,8 @@ fi
 # ---- ジョブの待機と、生成途中の出力の表示 ------------------------------------
 # ジョブは stream.txt に生成途中の出力を書き足し、stream.txt.stat に段階とトークン数を書く。
 # /work は計算ノードと共有なので、窓口サーバからこれを読んで表示できる。
-# 端末では、確定した行を上に流し、一番下に Claude Code 風の状態表示の行を出す。
+# 端末では、確定した行(本文・ツール・見出し)を上に流し、一番下に Claude Code 風の状態表示の行を出す。
+# 考える過程は流さず、状態表示の行のすぐ上の固定の枠(THINK_ROWS 行)の中で、最新の行だけを入れ替えて見せる。
 STREAM=$RUN/stream.txt
 TTY=0; [ -t 2 ] && TTY=1
 VERBS=(Simmering Pondering Brewing Percolating Cogitating Mulling Ruminating Noodling
@@ -366,6 +371,12 @@ FRAME=0.1                                     # 状態表示を描き直す間�
 SHINE=; [ -n "$BOLD" ] && SHINE=$'\e[1;96m'   # 動詞の上を流れる明るい帯の色(明るいシアン)
 VERB=${VERBS[RANDOM % ${#VERBS[@]}]}
 OFF=0 PARTIAL= SECTION= PHASE="queued" LASTPHASE= TOKENS=0 TICK=0
+THINK_BUF=() LIVE_H=0                         # 枠に出す考える過程の行 / 今描いている枠の高さ(状態表示の行を除く)
+COLS=80
+if (( TTY )); then
+  COLS=$(tput cols 2>/dev/null || echo 80)
+  trap 'COLS=$(tput cols 2>/dev/null || echo 80)' WINCH   # 端末の幅が変わったら測り直す
+fi
 printf -v START '%(%s)T' -1
 STATE=Q QSTAT_PID= QSTAT_AT=0 QSTATE_FILE=$RUN/.qstate
 # sleep コマンドを起動せずに待つため、何も書かれないパイプを read -t で待つ
@@ -376,19 +387,51 @@ exec {SLEEP_FD}<> <(:)
 fmt_time() { if (( $2 >= 60 )); then printf -v "$1" '%dm %ds' $(($2 / 60)) $(($2 % 60)); else printf -v "$1" '%ds' "$2"; fi; }
 fmt_tokens() { if (( $2 >= 1000 )); then printf -v "$1" '%d.%dk' $(($2 / 1000)) $(($2 % 1000 / 100)); else printf -v "$1" '%d' "$2"; fi; }
 
-# 状態表示の行を消す(端末のときだけ)
-clear_status() { (( TTY )) && printf '\r\e[K' >&2 || true; }
+# tail_fit <変数名> <文字列> <幅>: 文字列の末尾を、画面で <幅> 桁に収まる分だけ残す(切ったら先頭に …)。
+# 日本語などの全角文字は 2 桁と数える。毎コマ呼ぶので、明らかに収まる行はそのまま返す
+tail_fit() {
+  local s=$2 max=$3 i c cw=0 code n=${#2}
+  if (( n * 2 <= max )); then printf -v "$1" '%s' "$s"; return 0; fi
+  for (( i = n - 1; i >= 0; i-- )); do
+    c=${s:i:1}
+    printf -v code '%d' "'$c"
+    if (( code >= 0x1100 )); then cw=$(( cw + 2 )); else cw=$(( cw + 1 )); fi
+    if (( cw > max - 1 )); then printf -v "$1" '…%s' "${s:i+1}"; return 0; fi
+  done
+  printf -v "$1" '%s' "$s"
+}
+
+# 状態表示の行と、その上の考える過程の枠を消す(端末のときだけ)。カーソルは枠のあった一番上に戻る
+clear_status() {
+  (( TTY )) || return 0
+  local s=$'\r\e[K' i
+  for (( i = 0; i < LIVE_H; i++ )); do s+=$'\e[1A\e[K'; done
+  printf '%s' "$s" >&2
+  LIVE_H=0
+}
+
+# 確定した行を 1 行出す(枠と状態表示の行を消してから。次のコマで描き直される)
+out() { clear_status; printf '%s\n' "$1" >&2; }
+
+# 考える過程を枠に入れるか(端末で、枠を出すとき)
+think_in_box() { (( TTY )) && [ "$SECTION" = thinking ]; }
 
 # 確定した行を表示する。=== 見出し === で、考える過程(薄い色)か本文かを切り替える。
 emit_lines() {
   local line
   while IFS= read -r line; do
     case $line in
-      "=== Thinking ===")  SECTION=thinking; printf '%s\n' "${DIM}${CYAN}── thinking ──${RESET}" >&2 ;;
-      "=== Review ===")    SECTION=review;   printf '%s\n' "${CYAN}── review ──${RESET}" >&2 ;;
-      "=== "*" ===")       line=${line#=== }; printf '%s\n' "${DIM}${line% ===}${RESET}" >&2 ;;
-      *) if [ "$SECTION" = thinking ]; then printf '%s\n' "${DIM}${line}${RESET}" >&2
-         else printf '%s\n' "$line" >&2; fi ;;
+      "=== Thinking ===")  SECTION=thinking; THINK_BUF=()
+                           (( TTY )) || out "${DIM}${CYAN}── thinking ──${RESET}" ;;
+      "=== Review ===")    SECTION=review; THINK_BUF=(); out "${CYAN}── review ──${RESET}" ;;
+      "=== "*" ===")       line=${line#=== }; out "${DIM}${line% ===}${RESET}" ;;
+      *) if think_in_box; then
+           # 空行は飛ばし、最新の THINK_ROWS 行だけを残す
+           # set -e の下なので、条件が偽でも失敗にならないよう if で書く
+           if [ -n "${line// /}" ]; then THINK_BUF+=("$line"); fi
+           if (( ${#THINK_BUF[@]} > THINK_ROWS )); then THINK_BUF=("${THINK_BUF[@]: -THINK_ROWS}"); fi
+         elif [ "$SECTION" = thinking ]; then out "${DIM}${line}${RESET}"
+         else out "$line"; fi ;;
     esac
   done <<< "$1"
 }
@@ -405,7 +448,6 @@ pump_stream() {
   OFF=$size
   data=$PARTIAL$data
   if [[ $data == *$'\n'* ]]; then
-    clear_status
     emit_lines "${data%$'\n'*}"
     PARTIAL=${data##*$'\n'}
   else
@@ -520,10 +562,31 @@ draw_status() {
   info=$el
   if (( TOKENS > 0 )); then fmt_tokens tk "$TOKENS"; info+=" · ↓ $tk tokens"; fi
   info+=" · $PHASE · ctrl+c to cancel"
-  ptail=${PARTIAL: -60}
-  # 折り返しを止めて 1 回の書き込みで描く(長い行は画面の端で切れる)
+  # 考える過程の枠: 見出しと THINK_ROWS 行。高さは固定(足りない分は空行)で、画面を流さない
+  local box= rows=0 l w=$(( COLS - 4 )) i
+  local -a lines=()
+  if think_in_box && (( THINK_ROWS > 0 )); then
+    lines=("${THINK_BUF[@]}")
+    [ -n "${PARTIAL// /}" ] && lines+=("$PARTIAL")
+    if (( ${#lines[@]} > THINK_ROWS )); then lines=("${lines[@]: -THINK_ROWS}"); fi
+    box="${DIM}${CYAN}── thinking ──${RESET}"$'\e[K\n'; rows=1
+    for (( i = 0; i < THINK_ROWS; i++ )); do
+      l=${lines[i]:-}
+      tail_fit l "$l" "$w"                               # 長い行は末尾(書いている所)を見せる
+      box+="  ${DIM}${l}${RESET}"$'\e[K\n'; rows=$(( rows + 1 ))
+    done
+    ptail=
+  else
+    ptail=${PARTIAL: -60}
+  fi
+  # 前の枠の一番上に戻り、折り返しを止めて 1 回の書き込みで描く(長い行は画面の端で切れる)。
+  # 枠が低くなったときに残る古い行は、最後の \e[J で消す
+  local up=
+  for (( i = 0; i < LIVE_H; i++ )); do up+=$'\e[1A'; done
   shimmer verb "$VERB"
-  printf '\e[?7l\r%s…%s %s%s\e[K\e[?7h' "$verb" "$RESET" "${DIM}(${info})" "${ptail:+  $ptail}${RESET}" >&2
+  printf '\e[?7l\r%s%s%s…%s %s%s\e[K\e[J\e[?7h' "$up" "$box" "$verb" "$RESET" "${DIM}(${info})" \
+    "${ptail:+  $ptail}${RESET}" >&2
+  LIVE_H=$rows
   TICK=$(( TICK + 1 ))
 }
 
@@ -561,7 +624,7 @@ while :; do
 done
 rm -f "$QSTATE_FILE"
 pump_stream                                  # 最後に残った分を出す
-[ -n "$PARTIAL" ] && { clear_status; emit_lines "$PARTIAL"; PARTIAL=; }
+[ -n "$PARTIAL" ] && { emit_lines "$PARTIAL"; PARTIAL=; }
 finish_status
 trap - INT TERM
 STREAMED=0; (( !QUIET )) && [ -f "$STREAM" ] && STREAMED=1
