@@ -148,6 +148,15 @@ REVIEW_ONLY_PROMPT = """ツールはもう使えません。ツールを呼ば�
 指定の出力形式でレビューの本文だけを書いてください。確かめきれなかった点は「要確認」と明記してください。"""
 
 # 考える過程を打ち切ったときに、検討メモと一緒に渡す指示
+# ツールがまだ使えるうちに打ち切ったときの指示。上限を 3,000 に下げると、モデルは最初のツール呼び出しより前に
+# 打ち切られ(以前は最初の呼び出しまでに 3,600〜6,800 トークン考えていた)、MEMO_PROMPT で書かせると
+# ツールを 1 回も使わなかった(このリポジトリ自身の PR #1、レビューサーバ)。そこで、ツールはそのまま使わせる
+MEMO_TOOLS_PROMPT = """考える過程が長くなったため、ここで打ち切りました。下は、ここまでのあなたの検討メモです。
+ここからは考える過程なしで進めます。メモの方針で確かめたいことがあればツールを使い、なければ指定の出力形式でレビューを書いてください。
+
+## 検討メモ
+"""
+
 MEMO_PROMPT = """考える過程が長くなったため、ここで打ち切りました。下は、ここまでのあなたの検討メモです。
 これ以上の検討はせず、このメモと、これまでに得た差分・ツールの結果だけをもとに、指定の出力形式でレビューを書いてください。
 メモの中で確かめきれなかった点は「要確認」と明記してください。
@@ -513,6 +522,13 @@ def chat(host, model, system, user, stream, think=None, tools=None, timeout=3600
         res = chat_once(host, messages, model, stream, schemas, think, timeout)
         prompt_tokens += res.get("prompt_eval_count") or 0
         output_tokens += res.get("eval_count") or 0
+        if res.get("done_reason") == "thinking_limit" and schemas:
+            # ツールがまだ使えるなら、検討メモを渡して、考える過程なしでツールを使うか書くかを選ばせる
+            stream.begin(f"Thinking limit reached ({res['eval_count']:,} tokens); "
+                         "continuing from the notes without thinking", stream.part, stream.total)
+            messages.append({"role": "user", "content": MEMO_TOOLS_PROMPT + res["message"]["thinking"]})
+            think = False
+            continue
         if res.get("done_reason") == "thinking_limit":
             # 考える過程を検討メモとして渡し、考える過程もツールもなしで本文を書かせる
             stream.begin(f"Thinking limit reached ({res['eval_count']:,} tokens); "
