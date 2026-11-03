@@ -30,6 +30,9 @@ mcp = MCPServer("check")
 
 def files_under(p, exts):
     if os.path.isfile(p):
+        if not p.endswith(exts):
+            # 例: check_template に .py を渡されると、Python を HTML として読んで的外れな問題を返していた
+            raise ToolError(f"{rel(p)} is not a {' / '.join(exts)} file")
         return [p]
     out = []
     for d, dirs, files in os.walk(p):
@@ -61,6 +64,7 @@ def target_version():
 # E722 裸の except。書式や好みの規則は入れない(E7 を丸ごと選ぶと、変数名 l(E741)や
 # 1 行に複数の文(E702)まで出て、このリポジトリ自身のレビューでは 15 件中 11 件がそれだった)
 RUFF_RULES = "E9,F,B,E711,E712,E721,E722"
+PROBLEM_LINE = re.compile(r"^\S.*?:\d+:\d+: ")
 
 
 @mcp.tool()
@@ -83,7 +87,9 @@ def check_python(path: str = ".") -> str:
                                          "--output-format", "concise", "--select", RUFF_RULES,
                                          *(["--target-version", tv] if tv else []), "--", *files],
                        cwd=ROOT, capture_output=True, text=True, timeout=120)
-    lines = [l for l in r.stdout.splitlines() if l.strip() and not l.startswith(("Found ", "[*]", "No fixes"))]
+    # 問題の行(ファイル:行:桁: 規則 …)だけを数える。「All checks passed!」などの要約は数えない
+    # (以前は要約の行まで 1 件と数え、問題のないファイルで「1 problems」と返していた)
+    lines = [row for row in r.stdout.splitlines() if PROBLEM_LINE.match(row)]
     if r.returncode not in (0, 1) and not lines:
         raise ToolError(f"ruff failed: {r.stderr.strip()[:500]}")
     if not lines:
