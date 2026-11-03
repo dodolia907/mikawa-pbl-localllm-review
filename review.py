@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import re
+import sys
 import time
 import urllib.request
 
@@ -809,8 +810,14 @@ def main():
         from mcp_client import MCPTools       # mcp SDK が要るので、使うときだけ読み込む
         tools = MCPTools(args.mcp_config)
     try:
-        context = (build_context(args.context_dir, args.context_scope, [f["path"] for f in pr.get("files", [])],
-                                 args.context_label) if args.context_dir else ("", ""))
+        context = ("", "")
+        if args.context_dir and not os.path.isdir(args.context_dir):
+            # 黙って空のコードを載せないように、知らせて載せない
+            print(f"warning: --context-dir {args.context_dir} does not exist; reviewing without the code context",
+                  file=sys.stderr)
+        elif args.context_dir:
+            context = build_context(args.context_dir, args.context_scope, [f["path"] for f in pr.get("files", [])],
+                                    args.context_label)
         text, meta, part_reviews = review(args.host, args.model, pr, diff,
                                           StreamWriter(args.stream) if args.stream else None, tools,
                                           ReviewCache(args.cache_dir), context, comments_block(args.comments))
