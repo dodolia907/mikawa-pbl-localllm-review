@@ -133,6 +133,13 @@ def scope_note(paths, scopes=()):
     return (f"- この PR の変更は `{d}/` の中に収まっている。ツールで調べるのは原則この中と、"
             f"それが使う共通の設定(settings など)に限る。関係のないほかのフォルダ(ほかのチームやアプリ)は読まない。\n")
 
+# 考える過程なしで書かせるリクエストの出力の上限。レビューの本文はふつう数千トークンで収まる。
+# 40,960 のままだと、同じ行を繰り返すループに入ったときに 3 万トークン以上書き続けた(このリポジトリの PR #4)
+MAX_WRITE_TOKENS = 8_000
+# 同じ行(REPEAT_MIN_CHARS 文字以上)がこの回数続いたら、繰り返しのループとみなして打ち切る
+REPEAT_LIMIT = 3
+REPEAT_MIN_CHARS = 20
+
 # 1 回のリクエストで生成するトークン数の上限。これに達して本文が空なら、考える過程なしでやり直す。
 MAX_OUTPUT_TOKENS = 40_960
 # 1 回のリクエストで考える過程に使ってよいトークン数。超えたらそこで打ち切り、それまでの考える過程を
@@ -438,6 +445,9 @@ class StreamWriter:
         if res.get("done_reason") == "thinking_limit":
             self.note(f"\n\n=== Stopped thinking at {n} tokens, {time.time() - self.req_t0:.0f}s ===\n")
             return
+        if res.get("done_reason") == "repetition":
+            self.note(f"=== {n} output tokens, {time.time() - self.req_t0:.0f}s ===\n")
+            return
         self.note(f"\n\n=== {res.get('prompt_eval_count')} input tokens (read in {wait_s:.0f}s), "
                   f"{n} output tokens{rate}, {time.time() - self.req_t0:.0f}s ===\n")
 
@@ -458,7 +468,8 @@ def chat_once(host, messages, model, stream, tools=None, think=None, timeout=360
         "model": model,
         "messages": messages,
         "stream": True,
-        "options": {"temperature": 0.2, "num_predict": MAX_OUTPUT_TOKENS},
+        "options": {"temperature": 0.2,
+                    "num_predict": MAX_WRITE_TOKENS if think is False else MAX_OUTPUT_TOKENS},
     }
     if tools:
         req_body["tools"] = tools
@@ -468,6 +479,8 @@ def chat_once(host, messages, model, stream, tools=None, think=None, timeout=360
                                  headers={"Content-Type": "application/json"})
     content, thinking, calls, first, res = [], [], [], None, None
     n_think = 0                               # 考える過程のチャンク数(およそトークン数)
+    partial, last_line, repeats = "", None, 0  # 繰り返しの検出: 書きかけの行、直前の行、同じ行が続いた回数
+    n_out = 0                                 # 本文のチャンク数(およそトークン数)
     t0 = time.time()
     with urllib.request.urlopen(req, timeout=timeout) as r:
         for line in r:                        # 1 行に 1 つの JSON が届く
@@ -491,6 +504,24 @@ def chat_once(host, messages, model, stream, tools=None, think=None, timeout=360
             if msg.get("content"):
                 content.append(msg["content"])
                 stream.write("content", msg["content"])
+                n_out += 1
+                # 行が書き終わるたびに、直前の行と同じかを見る(空行や短い行は数えない)
+                *done, partial = (partial + msg["content"]).split("\n")
+                for row in (r.strip() for r in done):
+                    if len(row) < REPEAT_MIN_CHARS:
+                        continue
+                    repeats = repeats + 1 if row == last_line else 0
+                    last_line = row
+                if repeats >= REPEAT_LIMIT:
+                    # 繰り返しの 2 回目より前までを本文にする。接続を閉じると Ollama は生成をやめる
+                    text = "".join(content)
+                    first_at = text.find(last_line)
+                    content = [text[:text.find(last_line, first_at + len(last_line))].rstrip() + "\n"]
+                    stream.note(f"\n=== Stopped: the same line repeated {repeats + 1} times "
+                                "(kept the text before the repetition) ===\n")
+                    res = {"done_reason": "repetition", "eval_count": n_out, "prompt_eval_count": None,
+                           "eval_duration": 0}
+                    break
             calls += msg.get("tool_calls") or []
             if chunk.get("done"):
                 res = chunk
