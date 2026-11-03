@@ -18,6 +18,10 @@ Options:
   -H, --host NODE      Pin the job to a node (e.g. yind01)
   -m, --model MODEL    Ollama model (default flint:40b)
   -o, --output FILE    Also save the review to FILE
+      --mcp            Let the model read the repository (after the PR) through MCP tools,
+                       plus the servers in mcp.json next to review-pr if it exists
+      --scope DIR      With --mcp, only let the tools read DIR of the repository
+                       (e.g. teams/invtechno; comma-separate several directories)
       --post           Post the review as a PR comment (asks for confirmation first)
       --no-wait        Submit the job and exit without waiting
       --quiet          Do not stream the model's output; show progress only
@@ -41,7 +45,7 @@ die() { echo "review-pr: $*" >&2; exit 1; }
 
 ROOT=$(cd "$(dirname "$(realpath "$0")")" && pwd)
 MODEL=flint:40b
-OUTPUT= POST=0 WAIT=1 INTERACTIVE=0 QUIET=0 NEW_JOB=0 REQUIRE_SERVER=0 START_SERVER=0 SERVER_DIR=
+OUTPUT= POST=0 MCP=0 SCOPE= WAIT=1 INTERACTIVE=0 QUIET=0 NEW_JOB=0 REQUIRE_SERVER=0 START_SERVER=0 SERVER_DIR=
 REPO= PR=
 ARGS=()
 while (( $# )); do
@@ -53,6 +57,8 @@ while (( $# )); do
     -m|--model)  MODEL=${2:?}; shift 2 ;;
     -o|--output) OUTPUT=${2:?}; shift 2 ;;
     --post)      POST=1; shift ;;
+    --mcp)       MCP=1; shift ;;
+    --scope)     SCOPE=${2:?}; MCP=1; shift 2 ;;
     --no-wait)   WAIT=0; shift ;;
     --quiet)     QUIET=1; shift ;;
     --new-job)   NEW_JOB=1; shift ;;
@@ -167,6 +173,8 @@ interactive() {
     menu HOST "Node" "${HOST:-}" $'\tAny (whichever is free)' "${opts[0]}"$'\t'"${opts[0]}" "${opts[1]}"$'\t'"${opts[1]}"
   fi
 
+  menu MCP "Tools (MCP)" "$MCP" $'0\tDiff only' \
+    $'1\tLet the model read the repository after the PR through MCP tools (slower, more context)'
   menu POST "Post to PR" "$POST" $'0\tDo not post' $'1\tPost as a PR comment (shows the review and asks first)'
   if (( POST )); then
     WAIT=1
@@ -189,6 +197,8 @@ interactive() {
   fi
   [ "$MODEL" != flint:40b ] && cmd+=" -m $MODEL"
   [ -n "$OUTPUT" ] && cmd+=" -o $OUTPUT"
+  (( MCP )) && cmd+=" --mcp"
+  [ -n "$SCOPE" ] && cmd+=" --scope $SCOPE"
   (( POST )) && cmd+=" --post"
   (( WAIT )) || cmd+=" --no-wait"
   cmd+=" $REPO $PR"
@@ -212,9 +222,79 @@ echo "${BOLD}$REPO#$PR${RESET} $TITLE ${DIM}($(wc -l < "$RUN/pr.diff") diff line
 NPARTS=$(cd "$ROOT" && python3 -I -c 'import sys; sys.path.insert(0, "."); import review
 print(len(review.make_parts(open(sys.argv[1], encoding="utf-8", errors="replace").read())))' "$RUN/pr.diff")
 (( NPARTS > 1 )) && echo "${DIM}Large diff: reviewing in $NPARTS parts, then merging the results${RESET}" >&2
+
+# --mcp: PR 適用後のソースを窓口サーバで取得し(gh のトークンは計算ノードに渡さない)、
+# モデルがツールで読めるよう、MCP サーバの設定(mcp.json)を実行ディレクトリに置く
+if (( MCP )); then
+  . "$ROOT/jobs/run_review.sh"
+  [ -x "$UV" ] || { rm -rf "$RUN"; die "--mcp needs uv ($UV)"; }
+  SHA=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["headRefOid"])' "$RUN/pr.json")
+  mkdir -p "$RUN/src"
+  gh api "repos/$REPO/tarball/$SHA" | tar -xz -C "$RUN/src" --strip-components=1 \
+    || { rm -rf "$RUN"; die "cannot download the source of $REPO@${SHA:0:7}"; }
+  echo "${DIM}Source for MCP tools: $REPO@${SHA:0:7} ($(du -sh "$RUN/src" | cut -f1))${RESET}" >&2
+  mcp_prepare || { rm -rf "$RUN"; die "cannot prepare the MCP environment (uv, $MCP_SDK)"; }
+  # 組み込みのサーバ(repo: ファイルを読む、check: 静的な検査、docs: 資料)に、
+  # リポジトリ直下の mcp.json(あれば)のサーバを加える
+  python3 - "$ROOT/mcp.json" "$RUN/mcp.json" "$RUN/src" "${LLM_HOME:-/work/$USER/llm}/docs" "$SCOPE" <<'PY' \
+    || { rm -rf "$RUN"; die "cannot write the MCP settings"; }
+import glob, json, os, re, sys
+user_cfg, out, src, docs, scope = sys.argv[1:6]
+# --scope: ツールが読めるフォルダ(リポジトリ直下からの相対パス)。サーバの側で範囲の外を拒否する
+scopes = [s.strip().strip("/") for s in scope.split(",") if s.strip()]
+for s in scopes:
+    if not os.path.isdir(os.path.join(src, s)):
+        sys.exit(f"--scope: no such directory in the repository: {s}")
+scope_args = ["--scope", ",".join(scopes)] if scopes else []
+servers = {
+    "repo": {"command": "${PYTHON}", "args": ["${ROOT}/mcp_repo_server.py", "${RUN_DIR}/src", *scope_args]},
+    "check": {"command": "${PYTHON}", "args": ["${ROOT}/mcp_check_server.py", "${RUN_DIR}/src", *scope_args]},
+}
+
+def read(*names):
+    text = ""
+    for n in names:
+        for p in glob.glob(os.path.join(src, n)):
+            with open(p, encoding="utf-8", errors="replace") as f:
+                text += f.read() + "\n"
+    return text
+
+def vkey(d):
+    return [int(x) for x in re.findall(r"\d+", os.path.basename(d))]
+
+def pick(kind, want):
+    """取得済みの資料から、want(版の先頭部分)に合う最も新しい版を選ぶ。なければ最も新しい版。"""
+    have = sorted(glob.glob(os.path.join(docs, kind + "-*")), key=vkey)
+    match = [d for d in have if want and (os.path.basename(d) + ".").startswith(f"{kind}-{want}.")]
+    return (match or have or [None])[-1]
+
+deps = read("pyproject.toml", "requirements*.txt", "setup.cfg")
+py = re.search(r'requires-python\s*=\s*"[^"]*?(\d+\.\d+)', deps)
+dj = re.search(r'(?im)^\W*django\s*[=~<>!]=*\s*(\d+(?:\.\d+)*)', deps)
+uses_django = bool(re.search(r"(?i)\bdjango\b", deps)) or os.path.exists(os.path.join(src, "manage.py"))
+dirs = [pick("python", py and py.group(1))]
+if uses_django:
+    dirs.append(pick("django", dj and dj.group(1)))
+dirs.append(os.path.join(docs, "mdn-html") if os.path.isdir(os.path.join(docs, "mdn-html")) else None)
+dirs = [d for d in dirs if d]
+if dirs:
+    servers["docs"] = {"command": "${PYTHON}", "args": ["${ROOT}/mcp_docs_server.py", *dirs]}
+if os.path.exists(user_cfg):
+    with open(user_cfg) as f:
+        servers.update(json.load(f).get("mcpServers", {}))
+with open(out, "w") as f:
+    # scope は review.py がプロンプトで範囲を伝えるのに使う(MCP の設定としては使われない)
+    json.dump({"mcpServers": servers, "scope": scopes}, f, indent=2)
+docs_note = (" (docs: " + ", ".join(os.path.basename(d) for d in dirs) + ")") if dirs \
+    else " (no docs; run fetch-docs to add them)"
+print("MCP servers: " + ", ".join(servers) + docs_note
+      + (f"; tools read only {', '.join(s + '/' for s in scopes)}" if scopes else ""), file=sys.stderr)
+PY
+fi
 # ジョブの時間上限: 30 分 + パートごとに 15 分(Eduq は遅いので 2 倍)。最長 8 時間
 [ "$QUEUE" = Eduq ] && WALL_MIN=$(( 30 + NPARTS * 30 )) || WALL_MIN=$(( 30 + NPARTS * 15 ))
 (( NPARTS > 1 )) && WALL_MIN=$(( WALL_MIN + 15 ))   # まとめの分
+(( MCP )) && WALL_MIN=$(( WALL_MIN + NPARTS * 15 ))  # ツールを使う分
 (( WALL_MIN > 480 )) && WALL_MIN=480
 printf -v WALL '%02d:%02d:00' $(( WALL_MIN / 60 )) $(( WALL_MIN % 60 ))
 
@@ -259,7 +339,7 @@ if [ -n "$SERVER_DIR" ]; then
   REQ=$(date +%s%N)-$$
   echo queued > "$RUN/status"
   # サーバでの所要時間の見込み(モデルの読み込みがない分、ジョブより短い): パートごとに 10 分 + まとめ 10 分、Eduq は 2 倍
-  EST_MIN=$(( NPARTS * 10 + (NPARTS > 1 ? 10 : 0) ))
+  EST_MIN=$(( NPARTS * (MCP ? 20 : 10) + (NPARTS > 1 ? 10 : 0) ))
   [ "$QUEUE" = Eduq ] && EST_MIN=$(( EST_MIN * 2 ))
   echo "$RUN $MODEL $EST_MIN" > "$SERVER_DIR/.$REQ"
   mv "$SERVER_DIR/.$REQ" "$SERVER_DIR/queue/$REQ"
@@ -411,7 +491,7 @@ update_phase() {
        if [ -f "$STREAM.stat" ] && read -r p n part total < "$STREAM.stat" 2>/dev/null; then
          TOKENS=${n:-0}
          case $p in reading) PHASE="reading diff" ;; thinking) PHASE="thinking" ;;
-                    writing) PHASE="writing review" ;; done) PHASE="done" ;; esac
+                    writing) PHASE="writing review" ;; tool) PHASE="using tools" ;; done) PHASE="done" ;; esac
          # パートに分けているときは、何番目のパートか(またはまとめ中か)を前に付ける
          case ${part:--} in
            -) ;;
