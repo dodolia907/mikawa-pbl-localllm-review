@@ -291,6 +291,52 @@ flowchart TB
 - uv はジョブの中では `--offline` で動くので、追加のサーバに必要なパッケージは事前に用意しておく
 - 追加のサーバのツールも「サーバ名__ツール名」でモデルに見せる。書き込みのできるツールは足さない
 
+## ほかの Claude Code から使う(MCP サーバ)
+
+`review-mcp` を MCP サーバ(stdio)として登録すると、ほかの Claude Code から「PR #49 をレビューして」のように頼める。
+窓口サーバでポートは開けないので、Claude Code がサーバを子プロセスとして起動する形にしている。
+
+```bash
+# 窓口サーバ(ydev)の Claude Code から
+claude mcp add llm-review -- /work/$USER/mikawa-pbl-localllm-review/review-mcp
+
+# ほかのマシンの Claude Code から(ydev は ~/.ssh/config で窓口サーバに付けた名前。パスワードを聞かれない鍵の設定が要る)
+claude mcp add llm-review -- ssh ydev /work/<ユーザー名>/mikawa-pbl-localllm-review/review-mcp
+```
+
+どのディレクトリでも使いたいときは `--scope user` を付ける。
+
+```mermaid
+sequenceDiagram
+  participant CC as Claude Code
+  participant M as review-mcp<br/>(窓口サーバ)
+  participant J as ジョブ<br/>(GPU ノード)
+  CC->>M: start_review(repo, pr_number, ...)
+  M->>J: review-pr --no-wait(ジョブの投入かサーバへの依頼)
+  M-->>CC: run_id
+  loop 終わるまで(1 回の呼び出しで最大 120 秒待つ)
+    CC->>M: get_review(run_id, wait_seconds)
+    M-->>CC: queued / running(段階・トークン数)
+  end
+  J-->>M: review.md(共有の /work)
+  CC->>M: get_review(run_id)
+  M-->>CC: done とレビュー本文
+```
+
+| ツール | 中身 |
+|---|---|
+| `start_review` | PR のレビューを依頼し、`run_id` を返す。`model`・`queue`・`use_tools`(`--mcp`)・`scope`・`new_job` を選べる |
+| `get_review` | 状態(queued / running / done / failed)と、終わっていればレビュー本文。`wait_seconds`(最大 120)だけ終わるのを待てる |
+| `list_reviews` | 最近のレビューと状態 |
+| `cancel_review` | 待ち・実行中のレビューを取り消す |
+| `list_pull_requests` | リポジトリの PR の一覧(レビューする PR を選ぶため) |
+| `server_status` | レビューサーバの状態(`review-server status`) |
+
+- 中では `review-pr --no-wait` を呼ぶだけなので、レビューサーバが動いていればそこに依頼する
+- PR へのコメントの投稿はしない。投稿は、呼び出した側が利用者に確かめてから `gh` で行う
+- レビューは 5〜10 分かかる。Claude Code が待ちきれずにツールがタイムアウトするときは、`wait_seconds` を小さくするか、
+  環境変数 `MCP_TOOL_TIMEOUT`(ミリ秒)を大きくする
+
 ## モデルの選び方
 
 PR #3(CI の変更、差分 99 行)で、指摘を差分と照らし合わせて比べた結果(2026-11-03、iEduq):
@@ -334,6 +380,7 @@ PR 1 件だけでの比較なので、別の PR でも比べるとよい。同�
 | `mcp_docs_server.py` | Python・Django・HTML の公式資料を検索する MCP サーバ |
 | `mcp_scope.py` | `repo` と `check` が読める範囲(`--scope`)の判定 |
 | `fetch-docs` | `mcp_docs_server.py` が使う資料を取得する |
+| `review-mcp` / `mcp_review_server.py` | このレビュー CLI を、ほかの Claude Code から使う MCP サーバ |
 | `jobs/run_review.sh` | review.py の実行(mcp.json があれば uv の環境で MCP を使う) |
 | `jobs/review.pbs` | レビューのジョブ |
 | `jobs/ollama_env.sh` | Ollama の起動、モデルの取得、GPU への読み込みの確認 |

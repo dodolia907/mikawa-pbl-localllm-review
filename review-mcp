@@ -1,0 +1,11 @@
+#!/bin/bash
+# このレビュー CLI を MCP サーバ(stdio)として起動する。ほかの Claude Code などから登録して使う:
+#   claude mcp add llm-review -- /work/$USER/mikawa-pbl-localllm-review/review-mcp
+#   claude mcp add llm-review -- ssh ydev /work/$USER/mikawa-pbl-localllm-review/review-mcp   (ほかのマシンから)
+# 標準出力は MCP のやりとりに使うので、ここでは何も出さない(uv の表示は標準エラーに出る)。
+set -euo pipefail
+ROOT=$(cd "$(dirname "$(realpath "$0")")" && pwd)
+. "$ROOT/jobs/run_review.sh"          # mcp SDK の入った uv の環境(mcp_uv_run)
+# ssh 越しに起動されると PATH が短いことがあるので、gh・qsub・uv の場所を足す
+export PATH="$HOME/.local/bin:/opt/pbs/bin:$PATH"
+exec "$UV" run -q --no-project --python "$MCP_PYTHON" --with "$MCP_SDK" python "$ROOT/mcp_review_server.py"
