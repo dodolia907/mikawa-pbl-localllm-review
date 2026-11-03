@@ -8,6 +8,7 @@
 中では review-pr --no-wait を呼ぶだけで、ジョブの投入やサーバへの依頼の仕方は review-pr と同じ。
 PR へのコメントの投稿はしない(外に出る操作なので、呼び出し側が利用者に確かめてから gh で行う)。
 """
+import glob
 import json
 import os
 import re
@@ -193,10 +194,8 @@ def get_review(run_id: str, wait_seconds: int = 0) -> str:
 @mcp.tool()
 def list_reviews(limit: int = 10) -> str:
     """List recent reviews (newest first) with their run_id and status."""
-    dirs = [os.path.dirname(p) for p in
-            (os.path.join(RUNS, r, d, "pr.json") for r in os.listdir(RUNS) if os.path.isdir(os.path.join(RUNS, r))
-             for d in os.listdir(os.path.join(RUNS, r)))
-            if os.path.exists(p)] if os.path.isdir(RUNS) else []
+    # runs/<owner>_<repo>/<実行>/pr.json があるものが、1 件のレビュー
+    dirs = sorted(os.path.dirname(p) for p in glob.glob(os.path.join(RUNS, "*", "*", "pr.json")))
     dirs.sort(key=lambda d: os.path.getmtime(os.path.join(d, "pr.json")), reverse=True)
     out = []
     for d in dirs[:max(1, min(limit, 50))]:
