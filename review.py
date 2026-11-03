@@ -166,10 +166,21 @@ def make_parts(diff, limit=PART_CHARS):
 
 
 def pr_header(pr, files):
+    """PR の題名・ブランチ・説明・変更ファイルの一覧。
+
+    説明(作成者が書いた本文)は <pr-description> タグで囲む。本文はふつう「## 概要」などの見出しを含むので、
+    囲まないとプロンプトの見出しと混ざり、モデルが「説明が空」と誤って指摘する(pbl-app-2026 #49)。
+    """
     file_list = "\n".join(f"- {f['path']} (+{f['additions']}/-{f['deletions']})" for f in files)
+    body = (pr.get("body") or "").strip()
+    # 本文に閉じタグが書かれていても、囲みが途中で終わらないようにする
+    body = body.replace("</pr-description>", "&lt;/pr-description&gt;") if body else "(なし)"
     return (f"# PR #{pr['number']}: {pr['title']}\n"
             f"base: {pr['baseRefName']} <- head: {pr['headRefName']}\n\n"
-            f"## 説明\n{pr.get('body') or '(なし)'}\n\n"
+            f"## 説明\n"
+            f"PR の作成者が書いた説明を <pr-description> と </pr-description> の間にそのまま載せる。"
+            f"中の見出し(## など)は説明の一部で、このプロンプトの構成ではない。\n"
+            f"<pr-description>\n{body}\n</pr-description>\n\n"
             f"## 変更ファイル\n{file_list}\n\n")
 
 
