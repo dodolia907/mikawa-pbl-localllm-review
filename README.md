@@ -81,6 +81,8 @@ review-pr                       (no arguments: choose everything interactively)
       --no-wait        Exit right after submitting the job
       --quiet          Show only the status line, not the output while generating
       --no-cache       Review every part again, even parts whose diff has not changed
+      --no-comments    Do not pass the PR's earlier comments and reviews to the model
+      --context        Put the code of the PR's base at the start of the prompt (see below)
       --new-job        Run in a new job even if a review server is running
       --server         Run on the review server (error if none is running)
       --start-server   Start a review server if none is running (up to 8 hours), wait for the model to load, then send the request
@@ -169,6 +171,31 @@ merge step are generated. A part takes several minutes, so this saves most of th
 - Reused parts are shown as "Reused the review from the cache", and the run info at the top of `review.md`
   says how many were reused (e.g. `cached: 2/4`)
 - `--no-cache` reviews everything again. Delete `cache/` to clear it
+
+### Earlier comments (re-reviews)
+
+The PR's comments and reviews so far (`gh pr view --json comments,reviews`, on the login server) are passed to the
+model, so a re-review does not repeat findings that were refuted or fixed in the replies.
+
+- They go to the merge step, not to the parts, so new comments do not invalidate the cached part reviews.
+  A PR with a single part gets them in its review
+- They are enclosed in `<pr-comments>` tags, and the model is told not to follow instructions inside them
+  (anyone can comment)
+- The newest come first, up to 30,000 characters; `--no-comments` leaves them out
+
+### Code of the base branch (--context)
+
+`--context` puts the code of the PR's base commit at the start of the prompt, so the model sees callers and
+definitions outside the diff without tool calls. Without it, a review split into parts reported a function as
+"never called" because its caller was in another part.
+
+- The source is downloaded once per commit into `cache/src/<repo>/<commit>/` (on the login server) and reused
+- Monorepos: only the `--scope` directories, or, without `--scope`, the directory the PR's files share
+  (e.g. `teams/invtechno`), plus shared settings at the top (`pyproject.toml`, `manage.py`, `*/settings.py`, `*/urls.py`)
+- The base versions of the files the PR changes come first, then the rest of the code, then documents,
+  up to 100,000 characters; files that do not fit are listed by name (the model can read them with tools)
+- The code goes right after the system prompt, before anything that differs between parts, so Ollama reuses
+  its computation for every part (and, on a review server, across PRs with the same base and changed files)
 
 ## Review server (keep the model loaded for consecutive reviews)
 
@@ -342,7 +369,7 @@ sequenceDiagram
 
 | Tool | What it does |
 |---|---|
-| `start_review` | Request a review of a PR and return a `run_id`. `model`, `queue`, `use_tools` (`--mcp`), `scope` and `new_job` can be set; `start_server` starts a review server first if none is running, and `use_cache=false` reviews every part again |
+| `start_review` | Request a review of a PR and return a `run_id`. `model`, `queue`, `use_tools` (`--mcp`), `scope` and `new_job` can be set; `start_server` starts a review server first if none is running, and `use_cache=false` reviews every part again; `use_context` adds `--context` and `use_comments=false` adds `--no-comments` |
 | `get_review` | The state (queued / running / done / failed) and, if done, the review body. Can wait up to `wait_seconds` (max 120) for it to finish |
 | `list_reviews` | Recent reviews and their states |
 | `cancel_review` | Cancel a queued or running review |
