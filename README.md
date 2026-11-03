@@ -120,20 +120,29 @@ Queue / GPU  (↑↓ / j k to move, Enter to select, q to cancel)
 
 ### 実行中の表示
 
-ジョブを待つ間、画面の一番下に Claude Code 風の状態表示の行を出し、モデルが生成した内容を上に流す。
-考える過程(thinking)は薄い色、レビュー本文は通常の色で表示する。
+ジョブを待つ間、画面の一番下に Claude Code 風の状態表示の行を出す。
+考える過程(thinking)は、そのすぐ上の高さを固定した枠(既定 5 行)の中で、最新の行だけを入れ替えて薄い色で見せる。
+画面は流れない。レビュー本文・ツールの呼び出し・見出しは、枠の上に確定して流す。
 
 ```
+Reviewing the diff (12,345 chars)
+Tool: repo__read_file {"path": "teams/invtechno/docs/api.md"} -> teams/invtechno/docs/api.md (lines 1-194 of 194)
 ── thinking ──
-We need to review the CI workflow changes. The mac and windows jobs only run on ...
-Deliberating… (2m 41s · ↓ 3.4k tokens · thinking · ctrl+c to cancel)  so a push to a branch never builds
+  The doc says required credits total 12, but category A is 4 and B is 6 ...
+  So 4 + 6 = 10, which does not match the total. Let me check the example ...
+  In the example response, overall.remaining_earned is 10 but the categories ...
+  That is inconsistent too. I should flag it as high priority.
+  Next, the error format: 400 and 404 return the
+Deliberating… (2m 41s · ↓ 3.4k tokens · thinking · ctrl+c to cancel)
 ```
 
-- 状態表示の行は、経過時間・生成したトークン数・段階(queued → starting ollama → loading model onto gpu → reading diff → thinking → writing review)を示す。末尾は生成途中の行
+- 枠の行数は `--think-lines N` で変えられる(`0` で考える過程を出さない)。本文が始まると枠は消える
+- 枠に収まらない長い行は、末尾(今書いている所)を見せる
+- 状態表示の行は、経過時間・生成したトークン数・段階(queued → starting ollama → loading model onto gpu → reading diff → thinking → using tools → writing review)を示す。本文を書いている間は、末尾に生成途中の行を出す
 - 先頭の言葉(Deliberating など)の上を明るいシアンの帯が流れる。言葉は段階が変わるたびに変わる
 - 本文はすでに画面に流れているので、終わった後は保存先だけを表示する。標準出力をリダイレクトしたときは、本文を出力する
 - `--quiet` を付けると、生成途中の出力を流さず、状態表示だけにする
-- 端末でないとき(ログに保存するときなど)は、アニメーションの代わりに段階の変化を 1 行ずつ出す
+- 端末でないとき(ログに保存するときなど)は、アニメーションの代わりに段階の変化を 1 行ずつ出し、考える過程もすべて流す
 - CLI が表示する文言は英語。レビュー本文は日本語(`review.py` のプロンプトで指定)
 
 ### キュー
@@ -296,6 +305,9 @@ PR 1 件だけでの比較なので、別の PR でも比べるとよい。同�
 ## 制約と注意
 
 - 差分は約 16 万文字で打ち切る(コンテキスト長 131072 トークン)。打ち切られた後ろのファイルはレビューされない
+- 考える過程は 1 回のリクエストで 8,000 トークンまで(`review.py` の `THINK_LIMIT`)。超えたら打ち切り、
+  それまでの考える過程を「検討メモ」として渡して、考える過程なしで本文を書かせる。
+  同じ指摘の見直しを繰り返して本文になかなか進まない(pbl-app-2026 #49 で 2 万トークン超)のを防ぐ
 - レビューは誤りを含むことがある。`--post` で投稿するときは、内容を確かめてから投稿する
 - gh の認証情報は窓口サーバでだけ使う(計算ノードには PR の情報と差分だけを渡す)
 
