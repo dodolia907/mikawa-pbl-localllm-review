@@ -399,7 +399,7 @@ def chat(host, model, system, user, stream, think=None, tools=None, timeout=3600
         rejected_before = n_rejected
         for c in calls:
             fn = c.get("function", {})
-            name, args = fn.get("name", ""), fn.get("arguments") or {}
+            name, args = tools.resolve(fn.get("name", "")), fn.get("arguments") or {}
             if name.startswith("repo__") and repo_calls >= max_repo:
                 # 断った呼び出しは合計に数えない。次の応答でも続けば打ち切る
                 n_rejected += 1

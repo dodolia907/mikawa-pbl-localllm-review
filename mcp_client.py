@@ -91,10 +91,19 @@ class MCPTools:
     async def _call(self, server, tool, args):
         return await self.clients[server].call_tool(tool, args)
 
+    def resolve(self, name):
+        """モデルが呼んだ名前を「サーバ名__ツール名」にする。モデルは「read_file」のように接頭辞を付けずに
+        呼ぶことがある(このリポジトリ自身の PR #1)。1 つに決まればそれとみなし、決まらなければそのまま返す。"""
+        if name in self.tools:
+            return name
+        same = [n for n in self.tools if n.endswith("__" + name)]
+        return same[0] if len(same) == 1 else name
+
     def call(self, full_name, args):
         """ツールを呼び、モデルに渡す文字列を返す。失敗も文字列で返し、モデルに伝える。"""
+        full_name = self.resolve(full_name)
         if full_name not in self.tools:
-            return f"error: unknown tool {full_name}"
+            return f"error: unknown tool {full_name} (tools: {', '.join(sorted(self.tools))})"
         server, tool = self.tools[full_name]
         if isinstance(args, str):
             try:
