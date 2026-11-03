@@ -139,6 +139,10 @@ MAX_OUTPUT_TOKENS = 40_960
 # pbl-app-2026 #49 では、ツールを使い終えた後に同じ指摘の見直しを繰り返し、考える過程が 2 万トークンを超えた。
 THINK_LIMIT = 8_000
 
+# ツールを外した後に本文が空だったときの指示
+REVIEW_ONLY_PROMPT = """ツールはもう使えません。ツールを呼ばず、これまでに得た差分・ツールの結果・検討をもとに、
+指定の出力形式でレビューの本文だけを書いてください。確かめきれなかった点は「要確認」と明記してください。"""
+
 # 考える過程を打ち切ったときに、検討メモと一緒に渡す指示
 MEMO_PROMPT = """考える過程が長くなったため、ここで打ち切りました。下は、ここまでのあなたの検討メモです。
 これ以上の検討はせず、このメモと、これまでに得た差分・ツールの結果だけをもとに、指定の出力形式でレビューを書いてください。
@@ -434,6 +438,15 @@ def chat(host, model, system, user, stream, think=None, tools=None, timeout=3600
             messages.append({"role": "user", "content": "ツールの呼び出し回数の上限に達しました。"
                              "これ以上ツールは使えないので、ここまでの情報でレビューを書いてください。"})
         stream.round()
+    if tools and not res["message"]["content"].strip():
+        # ツールを外した後も、モデルがツールを呼ぼうとして本文が空になることがある
+        # (このリポジトリ自身の PR #1 で、検討メモから書かせた応答が空だった)。本文だけを書くよう一度促す
+        stream.begin("No review text (the model tried to use tools after they were removed); "
+                     "asking for the review only", stream.part, stream.total)
+        messages.append({"role": "user", "content": REVIEW_ONLY_PROMPT})
+        res = chat_once(host, messages, model, stream, None, False, timeout)
+        prompt_tokens += res.get("prompt_eval_count") or 0
+        output_tokens += res.get("eval_count") or 0
     res["prompt_eval_count"], res["eval_count"] = prompt_tokens, output_tokens
     res["tool_calls_total"], res["tool_calls_rejected"] = n_calls, n_rejected
     return res
@@ -442,15 +455,17 @@ def chat(host, model, system, user, stream, think=None, tools=None, timeout=3600
 def ask(host, model, system, user, stream, title, part="-", total=0, tools=None, paths=()):
     """1 回分のレビュー(またはまとめ)を得る。本文が空なら考える過程なしでやり直す。戻り値: (本文, 応答)"""
     stream.begin(title, part, total)
-    if tools:
-        system += tools_note(tools) + scope_note(paths, tools.scope)
-    res = chat(host, model, system, user, stream, tools=tools)
+    res = chat(host, model, system + (tools_note(tools) + scope_note(paths, tools.scope) if tools else ""),
+               user, stream, tools=tools)
     text = res["message"]["content"].strip()
     if not text:
-        # 考える過程だけで出力の上限に達すると、本文が空のまま終わる
-        stream.begin(f"Output limit reached while thinking ({res.get('eval_count')} tokens); "
-                     "retrying without thinking", part, total)
-        res = chat(host, model, system, user, stream, think=False, tools=tools)
+        # 考える過程だけで出力の上限に達すると、本文が空のまま終わる。ツールを使ったときにやり直すと、
+        # ツールの呼び出しを最初から繰り返してしまう(PR #1 で 1 パート分が二重になった)ので、ツールなしで行う
+        why = ("output limit reached while thinking" if res.get("done_reason") == "length"
+               else f"done_reason={res.get('done_reason')}")
+        stream.begin(f"The review was empty ({why}, {res.get('eval_count')} tokens); "
+                     f"retrying without thinking{' or tools' if tools else ''}", part, total)
+        res = chat(host, model, system, user, stream, think=False)
         text = res["message"]["content"].strip()
     if not text:
         raise RuntimeError(
