@@ -63,6 +63,8 @@ while :; do
     set -e
     # 依頼のモデルが載っているものと違えば、取得して読み込む(前のモデルは Ollama が必要に応じて降ろす)
     if [ "$REQ_MODEL" != "$LOADED" ]; then pull_model "$REQ_MODEL"; load_on_gpu "$REQ_MODEL"; fi
+    # 依頼ごとに読み直す(サーバを動かしたまま review-pr や review.py を直しても、次の依頼から反映される)
+    . "$ROOT/jobs/run_review.sh"
     run_review "$OLLAMA_URL" "$REQ_MODEL" "$RUN_DIR"
   ) > "$RUN_DIR/job.log" 2>&1 &
   pid=$!
