@@ -1,99 +1,99 @@
 # mikawa-pbl-localllm-review
 
-豊橋技科大 HPC の GPU でローカル LLM を動かし、GitHub の PR をレビューする CLI。
-`iEduq`(NVIDIA A100)と `Eduq`(AMD MI210)のどちらでも動く。
+A CLI that reviews GitHub pull requests with a local LLM running on the GPUs of the Toyohashi University of Technology HPC.
+It works on both `iEduq` (NVIDIA A100) and `Eduq` (AMD MI210).
 
 ```bash
 ./review-pr TechnoTUT/dmxctl 3
 ./review-pr https://github.com/TechnoTUT/dmxctl/pull/3
 ```
 
-## 仕組み
+## How it works
 
 ```
-review-pr(窓口サーバ ydev)
-  ├ gh で PR の情報と差分を取得(GitHub のトークンは計算ノードに渡さない)
-  ├ qsub で jobs/review.pbs を投入 ─→ GPU ノード(iEduq: A100 / Eduq: MI210)
-  │                                    ├ Ollama を起動し、モデルを用意して GPU に読み込む
-  │                                    └ review.py: 差分を渡してレビューを得る
-  ├ ジョブが終わるまで進み具合を表示(Ctrl-C でジョブも取り消す)
-  └ レビューを表示(--post なら確認のうえ PR にコメント)
+review-pr (login server ydev)
+  ├ Fetch the PR details and diff with gh (the GitHub token never leaves the login server)
+  ├ Submit jobs/review.pbs with qsub ─→ GPU node (iEduq: A100 / Eduq: MI210)
+  │                                    ├ Start Ollama, prepare the model and load it onto the GPU
+  │                                    └ review.py: pass the diff and get a review
+  ├ Show progress until the job finishes (Ctrl-C also cancels the job)
+  └ Print the review (with --post, comment on the PR after confirmation)
 ```
 
-結果は `runs/<owner>_<repo>/pr<番号>-<日時>/` に残る。
+Results are kept in `runs/<owner>_<repo>/pr<number>-<datetime>/`.
 
-| ファイル | 中身 |
+| File | Contents |
 |---|---|
-| `review.md` | レビュー |
-| `pr.json` / `pr.diff` | PR の情報と差分 |
-| `progress` | ジョブの進み具合 |
-| `stream.txt` / `stream.txt.stat` | 生成途中の出力 / 段階とトークン数 |
-| `job.log` / `ollama.log` | ジョブと Ollama のログ |
+| `review.md` | The review |
+| `pr.json` / `pr.diff` | PR details and diff |
+| `progress` | Job progress |
+| `stream.txt` / `stream.txt.stat` | Output while generating / stage and token count |
+| `job.log` / `ollama.log` | Job and Ollama logs |
 
-## 初回セットアップ(窓口サーバで 1 回だけ)
+## First-time setup (once, on the login server)
 
 ```bash
-# gh(管理者権限なしで ~/.local/bin に導入済み)のログイン
+# Log in to gh (installed in ~/.local/bin without admin rights)
 gh auth login
 
-# Ollama を /work/$USER/llm に展開(約 1.4GB)
+# Extract Ollama into /work/$USER/llm (about 1.4GB)
 mkdir -p /work/$USER/llm/ollama && cd /work/$USER/llm
 curl -fL -o ollama-linux-amd64.tar.zst \
   https://github.com/ollama/ollama/releases/download/v0.40.13/ollama-linux-amd64.tar.zst
 tar --use-compress-program=zstd -xf ollama-linux-amd64.tar.zst -C ollama
 
-# Eduq(AMD MI210)でも使う場合は、AMD(ROCm)版のライブラリを同じ場所に追加で展開する(約 1GB)
+# To also use Eduq (AMD MI210), extract the AMD (ROCm) libraries into the same place (about 1GB)
 curl -fL -o ollama-linux-amd64-rocm.tar.zst \
   https://github.com/ollama/ollama/releases/download/v0.40.13/ollama-linux-amd64-rocm.tar.zst
 tar --use-compress-program=zstd -xf ollama-linux-amd64-rocm.tar.zst -C ollama
 ```
 
-モデル(既定 `flint:40b`、約 23GB)は初回のジョブの中で `/work/$USER/llm/models` に取得され、以降は使い回される。
+The model (default `flint:40b`, about 23GB) is pulled into `/work/$USER/llm/models` during the first job and reused afterwards.
 
-## 使い方
+## Usage
 
 ```
-review-pr [オプション] <owner/repo> <PR番号>
-review-pr [オプション] <PR の URL>
-review-pr [オプション] <owner/repo>  (PR などを対話モードで選ぶ)
-review-pr                       (引数なし: 対話モードで順に選ぶ)
+review-pr [options] <owner/repo> <PR number>
+review-pr [options] <PR URL>
+review-pr [options] <owner/repo>  (choose the PR and the rest interactively)
+review-pr                       (no arguments: choose everything interactively)
 
-  -i, --interactive    対話モードで選ぶ(引数やオプションで指定した値が既定値になる)
-  -q, --queue QUEUE    使うキュー: iEduq(NVIDIA A100、既定)か Eduq(AMD MI210)
-  -g, --gpus N         使う GPU 数(iEduq は 1、Eduq は 1〜2。既定 1)
-  -H, --host NODE      ノードを固定する(例 yind01)
-  -m, --model MODEL    Ollama のモデル(既定 flint:40b)
-  -o, --output FILE    レビューを FILE にも保存する
-      --post           レビューを PR にコメントとして投稿する(投稿前に確認する)
-      --no-wait        ジョブを投入したら待たずに終わる
-      --quiet          生成途中の出力を流さず、状態表示だけにする
-      --new-job        レビューサーバが動いていても、新しいジョブで実行する
-      --server         レビューサーバで実行する(動いていなければエラー)
-      --start-server   レビューサーバが動いていなければ起動し(最長 8 時間)、モデルの読み込みを待ってから依頼する
+  -i, --interactive    Choose interactively (values given as arguments or options become the defaults)
+  -q, --queue QUEUE    Queue to use: iEduq (NVIDIA A100, default) or Eduq (AMD MI210)
+  -g, --gpus N         Number of GPUs (1 on iEduq, 1-2 on Eduq; default 1)
+  -H, --host NODE      Pin the node (e.g. yind01)
+  -m, --model MODEL    Ollama model (default flint:40b)
+  -o, --output FILE    Also save the review to FILE
+      --post           Post the review as a PR comment (asks for confirmation first)
+      --no-wait        Exit right after submitting the job
+      --quiet          Show only the status line, not the output while generating
+      --new-job        Run in a new job even if a review server is running
+      --server         Run on the review server (error if none is running)
+      --start-server   Start a review server if none is running (up to 8 hours), wait for the model to load, then send the request
 ```
 
-進み具合は標準エラーに、レビュー本文は標準出力に出るので、`> review.md` で本文だけ保存できる。
+Progress goes to stderr and the review body to stdout, so `> review.md` saves just the body.
 
-### 対話モード
+### Interactive mode
 
-引数なしで実行すると、リポジトリを入力した後、次の項目を矢印キーか Vim のキーで選ぶ。
-`./review-pr TechnoTUT/dmxctl` のようにリポジトリだけを指定すると、PR の選択から始まる。
+Run without arguments, enter the repository, then choose each of the following with the arrow keys or Vim keys.
+Give only the repository, as in `./review-pr TechnoTUT/dmxctl`, to start from choosing the PR.
 
-- PR(オープンな PR の一覧。「その他」で番号を入力すれば、マージ済みの PR なども指定できる)
-- キューと GPU(iEduq × 1、Eduq × 1、Eduq × 2)
-- モデル(取得済みの一覧。「その他」で名前を入力できる)
-- ノード(自動か固定)、PR に投稿するか、終わるまで待つか
+- PR (list of open PRs; choose "Other" and enter a number to pick a merged PR or the like)
+- Queue and GPUs (iEduq × 1, Eduq × 1, Eduq × 2)
+- Model (list of pulled models; choose "Other" to enter a name)
+- Node (automatic or pinned), whether to post to the PR, whether to wait until it finishes
 
-| キー | 動き |
+| Key | Action |
 |---|---|
-| `↑` / `k`、`↓` / `j` | 上下に移動 |
-| `g` / `G` | 先頭 / 末尾へ |
-| `1`〜`9` | その番号の選択肢へ |
-| Enter | 決定 |
-| `q`(または Ctrl-C) | 中止 |
+| `↑` / `k`, `↓` / `j` | Move up / down |
+| `g` / `G` | Go to first / last |
+| `1`-`9` | Go to that option |
+| Enter | Select |
+| `q` (or Ctrl-C) | Cancel |
 
-最後に同じ内容を引数で指定するコマンドを表示し、確認してから実行する。
-`-i` を付けると、引数やオプションで指定した値を既定値にして対話モードに入る。
+At the end it shows the equivalent command with arguments and runs it after confirmation.
+With `-i`, interactive mode starts with the values given as arguments or options as defaults.
 
 ```
 $ ./review-pr
@@ -105,10 +105,10 @@ Queue / GPU  (↑↓ / j k to move, Enter to select, q to cancel)
   Eduq   AMD MI210 64GB x2 (ysnd00/01; for models over 64GB, no speedup for models that fit on one)
 ```
 
-### 実行中の表示
+### Display while running
 
-ジョブを待つ間、画面の一番下に Claude Code 風の状態表示の行を出し、モデルが生成した内容を上に流す。
-考える過程(thinking)は薄い色、レビュー本文は通常の色で表示する。
+While waiting for the job, a Claude Code-style status line sits at the bottom of the screen and the model's output scrolls above it.
+The thinking is shown in a dim color and the review body in the normal color.
 
 ```
 ── thinking ──
@@ -116,86 +116,86 @@ We need to review the CI workflow changes. The mac and windows jobs only run on 
 Deliberating… (2m 41s · ↓ 3.4k tokens · thinking · ctrl+c to cancel)  so a push to a branch never builds
 ```
 
-- 状態表示の行は、経過時間・生成したトークン数・段階(queued → starting ollama → loading model onto gpu → reading diff → thinking → writing review)を示す。末尾は生成途中の行
-- 先頭の言葉(Deliberating など)の上を明るいシアンの帯が流れる。言葉は段階が変わるたびに変わる
-- 本文はすでに画面に流れているので、終わった後は保存先だけを表示する。標準出力をリダイレクトしたときは、本文を出力する
-- `--quiet` を付けると、生成途中の出力を流さず、状態表示だけにする
-- 端末でないとき(ログに保存するときなど)は、アニメーションの代わりに段階の変化を 1 行ずつ出す
-- CLI が表示する文言は英語。レビュー本文は日本語(`review.py` のプロンプトで指定)
+- The status line shows the elapsed time, the number of tokens generated and the stage (queued → starting ollama → loading model onto gpu → reading diff → thinking → writing review), followed by the line being generated
+- A bright cyan band sweeps across the leading word (Deliberating, etc.). The word changes with each stage
+- Since the body has already scrolled by, only the save location is shown at the end. When stdout is redirected, the body is written there
+- With `--quiet`, the output while generating is not shown, only the status line
+- When not on a terminal (e.g. when saving to a log), stage changes are printed one per line instead of the animation
+- The CLI's messages are in English. The review body is in Japanese (specified in the prompt in `review.py`)
 
-### キュー
+### Queues
 
-| キュー | ノード | GPU | 1 ジョブの上限 |
+| Queue | Nodes | GPU | Per-job limits |
 |---|---|---|---|
-| `iEduq` | yind00, yind01 | NVIDIA A100 80GB × 1 | CPU 8、メモリ 64GB、8 時間。flint で約 56 トークン/秒 |
-| `Eduq` | ysnd00, ysnd01 | AMD Instinct MI210 64GB × 2 | CPU 8、メモリ 64GB、GPU 2、8 時間。flint で約 30 トークン/秒 |
+| `iEduq` | yind00, yind01 | NVIDIA A100 80GB × 1 | 8 CPUs, 64GB memory, 8 hours. About 56 tokens/s with flint |
+| `Eduq` | ysnd00, ysnd01 | AMD Instinct MI210 64GB × 2 | 8 CPUs, 64GB memory, 2 GPUs, 8 hours. About 30 tokens/s with flint |
 
-- どちらも同時実行は 1 人 1 ジョブ。2 つのキューは別々なので、iEduq と Eduq で 1 本ずつ同時に動かせる
-- ジョブが保留(H)になると、`review-pr` はジョブを取り消して終わる。ノードの不調の可能性があるので、`-H` で別のノードを指定する
+- Each queue allows one running job per user. The two queues are separate, so you can run one job on iEduq and one on Eduq at the same time
+- If a job goes on hold (H), `review-pr` cancels it and exits. The node may be unhealthy, so pin another node with `-H`
 
-## レビューサーバ(モデルを載せたまま続けてレビューする)
+## Review server (keep the model loaded for consecutive reviews)
 
-`review-pr` を毎回ジョブとして実行すると、ジョブの開始から Ollama の起動・GPU の検出・モデルの読み込みまでに
-iEduq で約 1 分 45 秒(Eduq で約 35 秒)かかり、さらにキューの順番待ちもある。
-`review-server start` で常駐ジョブ(最長 8 時間)を立てておくと、モデルを GPU に載せたまま、
-`review-pr` からの依頼を順にレビューする。2 件目からは数秒で生成が始まる(2026-11-03 の実測で 5.5 秒)。
+Running `review-pr` as a new job each time takes about 1 min 45 s on iEduq (about 35 s on Eduq) from job start
+through starting Ollama, detecting the GPU and loading the model, on top of waiting in the queue.
+`review-server start` launches a resident job (up to 8 hours) that keeps the model on the GPU
+and reviews requests from `review-pr` in turn. From the second request on, generation starts within seconds (5.5 s measured on 2026-11-03).
 
 ```bash
-./review-server start              # iEduq で 8 時間。モデルを読み込み終わるまで待つ(約 1〜2 分)
-./review-server start -q Eduq -t 4 # Eduq で 4 時間
-./review-server status             # 動いているサーバ、残り時間、実行中・待ちの依頼
-./review-server stop               # 実行中のレビューを終えてから止める(--now ですぐ止める)
+./review-server start              # 8 hours on iEduq. Waits until the model is loaded (about 1-2 min)
+./review-server start -q Eduq -t 4 # 4 hours on Eduq
+./review-server status             # Running servers, time left, running and queued requests
+./review-server stop               # Stop after the running review finishes (--now to stop immediately)
 
-./review-pr TechnoTUT/dmxctl 3     # サーバが動いていれば自動でサーバに依頼する
-./review-pr --new-job TechnoTUT/dmxctl 3   # サーバがあっても新しいジョブで実行する
-./review-pr --start-server TechnoTUT/dmxctl 3   # サーバがなければ起動してから依頼する(-q でキューを選ぶ)
+./review-pr TechnoTUT/dmxctl 3     # Sends the request to the server automatically if one is running
+./review-pr --new-job TechnoTUT/dmxctl 3   # Runs in a new job even if a server is running
+./review-pr --start-server TechnoTUT/dmxctl 3   # Starts a server if none is running, then sends the request (choose the queue with -q)
 ```
 
-- 依頼は 1 件ずつ順に処理する。待っている間、状態表示の行に「waiting for the server (1 ahead)」のように前の件数を出す
-- 対話モードでは、動いているサーバが「Where to run」の最初の選択肢になる。
-  「Start a review server (up to 8h)」を選ぶと、サーバの動いていないキューから起動先を選べる(`--start-server` と同じ)
-- `--start-server` でサーバを待っている間に Ctrl-C を押すと、その依頼だけをやめる。サーバは起動を続ける
-- サーバと `review-pr` は共有の `/work` 上のファイル(`server/<ID>/`)でやりとりする。ポートは開けないので、
-  ほかの利用者からは使えない
-- 依頼したモデルが載っているものと違えば、サーバがそのモデルに切り替える
-- 残り時間が足りない依頼はサーバが断り、`review-pr` は自動で新しいジョブに切り替える
-- サーバも 1 ジョブとして数えるので、同じキューでは、サーバを動かしている間は別のジョブは順番待ちになる
-  (`--new-job` は、もう一方のキューで使うとよい)
+- Requests are processed one at a time. While waiting, the status line shows how many are ahead, e.g. "waiting for the server (1 ahead)"
+- In interactive mode, a running server is the first option under "Where to run".
+  Choosing "Start a review server (up to 8h)" lets you pick a queue with no server running to start one (same as `--start-server`)
+- Pressing Ctrl-C while `--start-server` is waiting for the server cancels only that request. The server keeps starting
+- The server and `review-pr` communicate through files on the shared `/work` (`server/<ID>/`). No port is opened,
+  so other users cannot use it
+- If the requested model differs from the loaded one, the server switches to that model
+- The server rejects requests that would not fit in the remaining time, and `review-pr` automatically falls back to a new job
+- The server counts as a job, so while it runs, other jobs on the same queue wait their turn
+  (use `--new-job` on the other queue)
 
-## モデルの選び方
+## Choosing a model
 
-PR #3(CI の変更、差分 99 行)で、指摘を差分と照らし合わせて比べた結果(2026-11-03、iEduq):
+Results of checking each model's findings against the diff of PR #3 (a CI change, 99-line diff) (2026-11-03, iEduq):
 
-| モデル | 正しい指摘 | 誤った指摘 | 時間 |
+| Model | Correct findings | Wrong findings | Time |
 |---|---|---|---|
-| qwen3-coder:30b | 0 | 2 | 19 秒 |
-| qwen3.8:27b-q8_0 | 3 | 0 | 243 秒 |
-| muse-glimmer:30b-q8_0 | 4 | 2 | 181 秒 |
-| **flint:40b**(既定) | **5** | **0** | 274 秒 |
-| ornith-1.5:35b | 5 | 1 | 412 秒 |
+| qwen3-coder:30b | 0 | 2 | 19 s |
+| qwen3.8:27b-q8_0 | 3 | 0 | 243 s |
+| muse-glimmer:30b-q8_0 | 4 | 2 | 181 s |
+| **flint:40b** (default) | **5** | **0** | 274 s |
+| ornith-1.5:35b | 5 | 1 | 412 s |
 
-PR 1 件だけでの比較なので、別の PR でも比べるとよい。同じ PR を別のモデルでレビューするには `-m` で指定する:
+This compares only one PR, so it is worth comparing on other PRs too. To review the same PR with another model, pass it with `-m`:
 
 ```bash
 ./review-pr -m qwen3.8:27b-q8_0 TechnoTUT/dmxctl 3
 ```
 
-## 制約と注意
+## Limitations and caveats
 
-- 差分は約 16 万文字で打ち切る(コンテキスト長 131072 トークン)。打ち切られた後ろのファイルはレビューされない
-- レビューは誤りを含むことがある。`--post` で投稿するときは、内容を確かめてから投稿する
-- gh の認証情報は窓口サーバでだけ使う(計算ノードには PR の情報と差分だけを渡す)
+- The diff is truncated at about 160,000 characters (context length 131072 tokens). Files after the cut are not reviewed
+- Reviews may contain mistakes. When posting with `--post`, check the content before posting
+- gh credentials are used only on the login server (compute nodes receive only the PR details and diff)
 
-## ファイル
+## Files
 
-| ファイル | 役割 |
+| File | Role |
 |---|---|
-| `review-pr` | CLI。PR の取得、ジョブの投入(またはサーバへの依頼)と待機、結果の表示と投稿 |
-| `review-server` / `jobs/server.pbs` | レビューサーバの起動・状態確認・停止 / 常駐ジョブ |
-| `jobs/server_common.sh` | サーバの一覧と生死の判定 |
-| `motd` | `review-pr` の起動時に表示するバナー(端末に出すときだけ) |
-| `jobs/ui.sh` | 色の設定と、対話用の入力・メニュー(`review-pr` と `review-server` で共通) |
-| `review.py` | Ollama にプロンプトを渡してレビューを得る(標準ライブラリのみ) |
-| `jobs/review.pbs` | レビューのジョブ |
-| `jobs/ollama_env.sh` | Ollama の起動、モデルの取得、GPU への読み込みの確認 |
-| `jobs/qsub_common.sh` | キューに応じた qsub の引数(コンテナ・GPU 数・ノード) |
+| `review-pr` | The CLI. Fetches the PR, submits the job (or sends a request to the server) and waits, shows and posts the result |
+| `review-server` / `jobs/server.pbs` | Start, check and stop the review server / the resident job |
+| `jobs/server_common.sh` | Listing servers and checking whether they are alive |
+| `motd` | Banner shown when `review-pr` starts (only on a terminal) |
+| `jobs/ui.sh` | Color settings and interactive prompts and menus (shared by `review-pr` and `review-server`) |
+| `review.py` | Sends the prompt to Ollama and gets the review (standard library only) |
+| `jobs/review.pbs` | The review job |
+| `jobs/ollama_env.sh` | Starting Ollama, pulling the model and confirming it is loaded onto the GPU |
+| `jobs/qsub_common.sh` | qsub arguments for each queue (container, GPU count, node) |
