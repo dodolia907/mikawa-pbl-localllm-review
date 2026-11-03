@@ -10,14 +10,24 @@ It works on both `iEduq` (NVIDIA A100) and `Eduq` (AMD MI210).
 
 ## How it works
 
-```
-review-pr (login server ydev)
-  ├ Fetch the PR details and diff with gh (the GitHub token never leaves the login server)
-  ├ Submit jobs/review.pbs with qsub ─→ GPU node (iEduq: A100 / Eduq: MI210)
-  │                                    ├ Start Ollama, prepare the model and load it onto the GPU
-  │                                    └ review.py: pass the diff and get a review
-  ├ Show progress until the job finishes (Ctrl-C also cancels the job)
-  └ Print the review (with --post, comment on the PR after confirmation)
+```mermaid
+sequenceDiagram
+  participant U as User
+  participant C as review-pr<br/>(login server ydev)
+  participant G as GitHub
+  participant J as Job<br/>(GPU node iEduq A100 / Eduq MI210)
+  U->>C: review-pr owner/repo number
+  C->>G: Fetch the PR details and diff with gh
+  Note over C,J: The GitHub token is never passed to the compute node
+  C->>J: Submit jobs/review.pbs with qsub
+  J->>J: Start Ollama, prepare the model and load it onto the GPU
+  J->>J: Pass the diff to review.py and get a review
+  J-->>C: stream.txt and review.md (on the shared /work)
+  C-->>U: Show progress until it finishes (Ctrl-C also cancels the job)
+  C-->>U: Print the review
+  opt --post
+    C->>G: Comment on the PR after confirmation
+  end
 ```
 
 Results are kept in `runs/<owner>_<repo>/pr<number>-<datetime>/`.
