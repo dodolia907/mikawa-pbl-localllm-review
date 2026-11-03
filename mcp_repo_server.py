@@ -15,6 +15,7 @@ import re
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
+from mcp_lines import numbered
 from mcp_scope import bases, inside, rel, resolve
 
 MAX_LINES = 400          # read_file で 1 回に返す行数の上限
@@ -72,11 +73,7 @@ def read_file(path: str, start_line: int = 1, end_line: int = 0) -> str:
         raise ToolError(f"not a file: {path}")
     with open(p, encoding="utf-8", errors="replace") as f:
         lines = f.read().splitlines()
-    start = max(start_line, 1)
-    end = min(end_line if end_line > 0 else start + MAX_LINES - 1, start + MAX_LINES - 1, len(lines))
-    body = "\n".join(f"{i}: {lines[i - 1]}" for i in range(start, end + 1))[:MAX_CHARS]
-    rest = f"\n... ({len(lines)} lines in total; read more with start_line={end + 1})" if end < len(lines) else ""
-    return f"{rel(p)} (lines {start}-{end} of {len(lines)})\n{body}{rest}"
+    return numbered(rel(p), lines, start_line, end_line, MAX_LINES, MAX_CHARS)
 
 
 @mcp.tool()
@@ -89,7 +86,7 @@ def search(pattern: str, path: str = ".", file_pattern: str = "*") -> str:
     try:
         rx = re.compile(pattern)
     except re.error as e:
-        raise ToolError(f"invalid regular expression: {e}")
+        raise ToolError(f"invalid regular expression: {e}") from e
     out = []
     files = [(b, f) for b in bases(path) for f in ([b] if os.path.isfile(b) else walk(b))]
     for base, f in files:

@@ -16,9 +16,12 @@ import sys
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
+from mcp_lines import numbered
+
 DIRS = [os.path.realpath(d) for d in sys.argv[1:]]
 BASE = os.path.dirname(DIRS[0]) if DIRS else "."
 MAX_LINES = 300
+MAX_CHARS = 40_000       # 1 回の結果の文字数の上限(約 1 万トークン)
 MAX_RESULTS = 10
 UNDERLINE = re.compile(r"^([=\-~*^\"#+'`])\1{2,}\s*$")
 
@@ -101,7 +104,7 @@ def search_docs(query: str, source: str = "all") -> str:
     df = [sum(1 for h in hits if h[k]) for k in range(len(terms))]
     idf = [math.log((len(sections) + 1) / (d + 1)) + 0.1 for d in df]
     scored = []
-    for (src, path, line, title, body), h in zip(sections, hits):
+    for (src, path, line, title, body), h in zip(sections, hits, strict=True):
         matched = [k for k in range(len(terms)) if h[k]]
         if not matched:
             continue
@@ -139,11 +142,7 @@ def read_doc(path: str, start_line: int = 1, end_line: int = 0) -> str:
         raise ToolError(f"no such document: {path}")
     with open(p, encoding="utf-8", errors="replace") as f:
         lines = f.read().splitlines()
-    start = max(start_line, 1)
-    end = min(end_line if end_line > 0 else start + MAX_LINES - 1, start + MAX_LINES - 1, len(lines))
-    body = "\n".join(f"{i}: {lines[i - 1]}" for i in range(start, end + 1))
-    rest = f"\n... ({len(lines)} lines in total; read more with start_line={end + 1})" if end < len(lines) else ""
-    return f"{path} (lines {start}-{end} of {len(lines)})\n{body}{rest}"
+    return numbered(path, lines, start_line, end_line, MAX_LINES, MAX_CHARS)
 
 
 if __name__ == "__main__":
