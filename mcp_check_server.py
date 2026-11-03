@@ -57,8 +57,10 @@ def target_version():
 
 
 # ruff の規則: E9 構文エラー、F pyflakes(未定義の名前、使っていない import・変数など)、
-# E7 比較の誤りなど、B bugbear(可変の既定値、例外の握りつぶしなど)。書式や好みの規則は入れない
-RUFF_RULES = "E9,E7,F,B"
+# B bugbear(可変の既定値、例外の握りつぶしなど)、E711・E712 None や True との ==、E721 type() の比較、
+# E722 裸の except。書式や好みの規則は入れない(E7 を丸ごと選ぶと、変数名 l(E741)や
+# 1 行に複数の文(E702)まで出て、このリポジトリ自身のレビューでは 15 件中 11 件がそれだった)
+RUFF_RULES = "E9,F,B,E711,E712,E721,E722"
 
 
 @mcp.tool()

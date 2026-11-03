@@ -193,7 +193,7 @@ check Python, HTML and Django templates, and confirm API usage in the official d
 | Server | Tools | What they do |
 |---|---|---|
 | `repo` | `read_file` / `search` / `list_files` | Read the repository with the PR applied (with line numbers, up to 400 lines per call) |
-| `check` | `check_python` | Check for syntax errors, undefined names, unused imports and bugbear rules with ruff (no formatting rules) |
+| `check` | `check_python` | Check for syntax errors, undefined names, unused imports, bugbear rules, `== None` / `== True`, `type()` comparisons and bare `except` with ruff (no formatting or naming rules) |
 | | `check_template` | Check that HTML and Django templates have matching open and close tags, `{% if %}`…`{% endif %}`, etc. |
 | `docs` | `search_docs` / `read_doc` | Search and read the official Python, Django and HTML (MDN) docs. The search ignores function words (on, which, etc.); if no section contains every word, results are ranked by how many words they contain (rarer words weigh more). Descriptions of current behaviour come before changelogs (releases) |
 
