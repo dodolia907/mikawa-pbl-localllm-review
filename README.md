@@ -35,6 +35,7 @@ Results are kept in `runs/<owner>_<repo>/pr<number>-<datetime>/`.
 | File | Contents |
 |---|---|
 | `review.md` | The review |
+| `src/` / `mcp.json` | With `--mcp`: the source with the PR applied / MCP server settings |
 | `pr.json` / `pr.diff` | PR details and diff |
 | `progress` | Job progress |
 | `stream.txt` / `stream.txt.stat` | Output while generating / stage and token count |
@@ -74,6 +75,8 @@ review-pr                       (no arguments: choose everything interactively)
   -H, --host NODE      Pin the node (e.g. yind01)
   -m, --model MODEL    Ollama model (default flint:40b)
   -o, --output FILE    Also save the review to FILE
+      --mcp            Let the model read the repository, run checks and look up docs with MCP tools (see below)
+      --scope DIR      Limit what the --mcp tools can read to DIR in the repository (e.g. teams/invtechno)
       --post           Post the review as a PR comment (asks for confirmation first)
       --no-wait        Exit right after submitting the job
       --quiet          Show only the status line, not the output while generating
@@ -117,20 +120,29 @@ Queue / GPU  (↑↓ / j k to move, Enter to select, q to cancel)
 
 ### Display while running
 
-While waiting for the job, a Claude Code-style status line sits at the bottom of the screen and the model's output scrolls above it.
-The thinking is shown in a dim color and the review body in the normal color.
+While waiting for the job, a Claude Code-style status line sits at the bottom of the screen.
+The thinking is shown in a dim color in a fixed-height box just above it (5 lines by default), where only the newest lines are swapped in.
+The screen does not scroll for it. The review body, tool calls and headings are committed above the box and scroll up.
 
 ```
+Reviewing the diff (12,345 chars)
+Tool: repo__read_file {"path": "teams/invtechno/docs/api.md"} -> teams/invtechno/docs/api.md (lines 1-194 of 194)
 ── thinking ──
-We need to review the CI workflow changes. The mac and windows jobs only run on ...
-Deliberating… (2m 41s · ↓ 3.4k tokens · thinking · ctrl+c to cancel)  so a push to a branch never builds
+  The doc says required credits total 12, but category A is 4 and B is 6 ...
+  So 4 + 6 = 10, which does not match the total. Let me check the example ...
+  In the example response, overall.remaining_earned is 10 but the categories ...
+  That is inconsistent too. I should flag it as high priority.
+  Next, the error format: 400 and 404 return the
+Deliberating… (2m 41s · ↓ 3.4k tokens · thinking · ctrl+c to cancel)
 ```
 
-- The status line shows the elapsed time, the number of tokens generated and the stage (queued → starting ollama → loading model onto gpu → reading diff → thinking → writing review), followed by the line being generated
+- Change the box height with `--think-lines N` (`0` hides the thinking). The box disappears once the body starts
+- Lines too long for the box show their end (where it is currently writing)
+- The status line shows the elapsed time, the number of tokens generated and the stage (queued → starting ollama → loading model onto gpu → reading diff → thinking → using tools → writing review). While the body is being written, the line being generated is shown at the end
 - A bright cyan band sweeps across the leading word (Deliberating, etc.). The word changes with each stage
 - Since the body has already scrolled by, only the save location is shown at the end. When stdout is redirected, the body is written there
 - With `--quiet`, the output while generating is not shown, only the status line
-- When not on a terminal (e.g. when saving to a log), stage changes are printed one per line instead of the animation
+- When not on a terminal (e.g. when saving to a log), stage changes are printed one per line instead of the animation, and all of the thinking is printed
 - The CLI's messages are in English. The review body is in Japanese (specified in the prompt in `review.py`)
 
 ### Queues
@@ -172,6 +184,161 @@ and reviews requests from `review-pr` in turn. From the second request on, gener
 - The server counts as a job, so while it runs, other jobs on the same queue wait their turn
   (use `--new-job` on the other queue)
 
+## Using MCP tools (--mcp)
+
+With `--mcp`, the model can call MCP tools during the review. It can read files in the repository to check things
+the diff alone cannot settle (callers of a changed function, type and constant definitions, config files, etc.),
+check Python, HTML and Django templates, and confirm API usage in the official docs for the version in use.
+
+| Server | Tools | What they do |
+|---|---|---|
+| `repo` | `read_file` / `search` / `list_files` | Read the repository with the PR applied (with line numbers, up to 400 lines per call) |
+| `check` | `check_python` | Check for syntax errors, undefined names, unused imports, bugbear rules, `== None` / `== True`, `type()` comparisons and bare `except` with ruff (no formatting or naming rules) |
+| | `check_template` | Check that HTML and Django templates have matching open and close tags, `{% if %}`…`{% endif %}`, etc. |
+| `docs` | `search_docs` / `read_doc` | Search and read the official Python, Django and HTML (MDN) docs. The search ignores function words (on, which, etc.); if no section contains every word, results are ranked by how many words they contain (rarer words weigh more). Descriptions of current behaviour come before changelogs (releases) |
+
+The model is told not to write findings that rest on Django, Python or HTML behaviour (CSRF and cookies, field arguments,
+template tags, etc.) from memory, but to check them with `docs` and cite the path of the doc it relied on (or mark them "needs checking" if it cannot confirm).
+The prompt only describes the tools of servers that were started (if the docs have not been fetched, `docs` is not described).
+
+`check` does not run the PR's code (it only reads and inspects files). Checks that run code, such as `manage.py check` or tests,
+are left out because students' code would run on the compute node and could reach things like the gh credentials
+on the shared `/home`.
+
+Fetch the docs once on the login server (about 25MB, into `/work/$USER/llm/docs`). If they have not been fetched, `docs` is not used:
+
+```bash
+./fetch-docs                               # Python 3.14, Django 6.1.2, HTML (MDN)
+./fetch-docs --python 3.13 --django 5.2.8  # Add other versions
+```
+
+The version is chosen from the reviewed repository's `pyproject.toml` (`requires-python`, `django==`) or `requirements*.txt`
+(the newest fetched version if none matches). Repositories that do not use Django are not given the Django docs.
+
+```bash
+./review-pr --mcp TechnoTUT/dmxctl 3
+```
+
+```mermaid
+flowchart TB
+  subgraph ydev["Login server (review-pr)"]
+    A["Fetch the source (tarball) at the PR head with gh api<br/>runs/.../src/"]
+    B["Write the MCP server settings<br/>runs/.../mcp.json"]
+    A --> B
+  end
+  subgraph node["Job (GPU node)"]
+    R["review.py<br/>Python 3.12 from uv + mcp SDK"]
+    O["Ollama"]
+    subgraph mcp["MCP servers (started over stdio, read-only)"]
+      S1["repo<br/>read_file / search / list_files"]
+      S2["check<br/>check_python / check_template"]
+      S3["docs<br/>search_docs / read_doc"]
+    end
+    R -- "Diff and tool list" --> O
+    O -- "Tool calls" --> R
+    R -- "Run the tool" --> mcp
+    mcp -- "Result" --> R
+  end
+  B --> R
+  D[("Docs<br/>/work/$USER/llm/docs")] -.-> S3
+```
+
+Each time the model calls a tool, review.py runs it on the MCP server and returns the result, repeating until the model gives an answer.
+
+- Every tool is read-only and cannot read outside `src/` (and the docs)
+- Up to 12 calls per part (the number left is appended to each result). After that the model must write without tools.
+  Of those, the `repo__*` tools that read the repository are limited to 6 (when `check` and `docs` are also available; `MAX_REPO_CALLS` in `review.py`).
+  Once used up, `repo__*` is removed from the tool list, and calls that still come in are refused without running.
+  Refused calls do not count toward the 12, so they do not eat into the calls left for `check` and `docs`;
+  if two responses in a row contain refused calls, the tools are cut off and the model writes the review.
+  Only telling it "don't wander around reading" in the prompt left it reading the team's documents one after another, with no calls left to check the docs.
+  Each tool call is shown on screen as one dim line
+- The prompt names the folder common to the changed files (e.g. `teams/invtechno`) and tells the model not to wander through other folders.
+  In a monorepo, without this limit it reads the teams' documents one after another and the thinking grows long too
+  (on pbl-app-2026 #49, a PR touching two Markdown files, it made 32 calls and the thinking exceeded 19,000 tokens)
+- The source is fetched on the login server, so the gh token is never passed to the compute node
+- To use the official mcp SDK (Python 3.10+), an environment with Python 3.12, `mcp==2.3.0` and `ruff==0.17.3` is prepared with uv
+  (`jobs/run_review.sh`). It is downloaded on the login server and cached (`~/.cache/uv`), so the job does not use the network
+- Tool results add to the input and take more time (the job time limit is extended by 15 minutes per part)
+- The model must support tool calling (`flint:40b` does)
+
+### Limiting what can be read (--scope)
+
+To target just one team in a monorepo, set the folders the tools can read with `--scope` (this also enables `--mcp`):
+
+```bash
+./review-pr --scope teams/invtechno https://github.com/mikawa-pbl/pbl-app-2026/pull/49
+./review-pr --scope teams/invtechno,teams/mint ...   # Comma-separated for several
+```
+
+- `repo` and `check` reject paths outside the scope (including `..`, absolute paths and symlinks pointing outside it).
+  Omitting `path` targets the scope folders, and giving a parent folder such as `teams` inspects only the scoped parts inside it
+- The prompt also says "only these folders are in scope"
+- Shared settings (such as `pbl_project/settings.py`) become unreadable too. Add them to `--scope` if you want them visible
+- `docs` (the official docs) is not affected, since it is not the repository
+
+### Adding other MCP servers
+
+Put a `mcp.json` at the repository root to use its servers as well. The format is the same as Claude Code's `.mcp.json`.
+The servers are started on the compute node. `${PYTHON}` (a Python with the mcp SDK), `${ROOT}` and `${RUN_DIR}` in strings are substituted.
+
+```json
+{"mcpServers": {
+  "docs": {"command": "${PYTHON}", "args": ["/work/you/my_docs_server.py"]},
+  "wiki": {"type": "http", "url": "https://example.com/mcp"}
+}}
+```
+
+- HTTP servers must use a URL reachable from the compute node (authentication via headers is not supported)
+- uv runs with `--offline` inside the job, so prepare any packages the extra servers need in advance
+- Tools of extra servers are also shown to the model as "server name__tool name". Do not add tools that can write
+
+## Using it from other Claude Code sessions (MCP server)
+
+Register `review-mcp` as an MCP server (stdio), and other Claude Code sessions can ask things like "review PR #49".
+No port is opened on the login server, so Claude Code starts the server as a child process.
+
+```bash
+# From Claude Code on the login server (ydev)
+claude mcp add llm-review -- /work/$USER/mikawa-pbl-localllm-review/review-mcp
+
+# From Claude Code on another machine (ydev is the name given to the login server in ~/.ssh/config; needs a key that does not prompt for a password)
+claude mcp add llm-review -- ssh ydev /work/<username>/mikawa-pbl-localllm-review/review-mcp
+```
+
+Add `--scope user` to use it from any directory.
+
+```mermaid
+sequenceDiagram
+  participant CC as Claude Code
+  participant M as review-mcp<br/>(login server)
+  participant J as Job<br/>(GPU node)
+  CC->>M: start_review(repo, pr_number, ...)
+  M->>J: review-pr --no-wait (submit a job or send to the server)
+  M-->>CC: run_id
+  loop Until done (each call waits up to 120 s)
+    CC->>M: get_review(run_id, wait_seconds)
+    M-->>CC: queued / running (stage, token count)
+  end
+  J-->>M: review.md (on the shared /work)
+  CC->>M: get_review(run_id)
+  M-->>CC: done and the review body
+```
+
+| Tool | What it does |
+|---|---|
+| `start_review` | Request a review of a PR and return a `run_id`. `model`, `queue`, `use_tools` (`--mcp`), `scope` and `new_job` can be set |
+| `get_review` | The state (queued / running / done / failed) and, if done, the review body. Can wait up to `wait_seconds` (max 120) for it to finish |
+| `list_reviews` | Recent reviews and their states |
+| `cancel_review` | Cancel a queued or running review |
+| `list_pull_requests` | List a repository's PRs (to pick one to review) |
+| `server_status` | Review server status (`review-server status`) |
+
+- Internally it just calls `review-pr --no-wait`, so the request goes to a review server if one is running
+- It does not post comments to the PR. To post, the caller confirms with the user and then uses `gh`
+- A review takes 5-10 minutes. If the tool times out in Claude Code, lower `wait_seconds`
+  or raise the `MCP_TOOL_TIMEOUT` environment variable (milliseconds)
+
 ## Choosing a model
 
 Results of checking each model's findings against the diff of PR #3 (a CI change, 99-line diff) (2026-11-03, iEduq):
@@ -193,6 +360,9 @@ This compares only one PR, so it is worth comparing on other PRs too. To review 
 ## Limitations and caveats
 
 - The diff is truncated at about 160,000 characters (context length 131072 tokens). Files after the cut are not reviewed
+- Thinking is limited to 8,000 tokens per request (`THINK_LIMIT` in `review.py`). Beyond that it is cut off,
+  the thinking so far is passed back as "review notes", and the model writes the body without thinking.
+  This stops it from re-examining the same findings over and over without getting to the body (over 20,000 tokens on pbl-app-2026 #49)
 - Reviews may contain mistakes. When posting with `--post`, check the content before posting
 - gh credentials are used only on the login server (compute nodes receive only the PR details and diff)
 
@@ -205,7 +375,15 @@ This compares only one PR, so it is worth comparing on other PRs too. To review 
 | `jobs/server_common.sh` | Listing servers and checking whether they are alive |
 | `motd` | Banner shown when `review-pr` starts (only on a terminal) |
 | `jobs/ui.sh` | Color settings and interactive prompts and menus (shared by `review-pr` and `review-server`) |
-| `review.py` | Sends the prompt to Ollama and gets the review (standard library only) |
+| `review.py` | Sends the prompt to Ollama and gets the review (standard library only without `--mcp-config`) |
+| `mcp_client.py` | Connects to MCP servers and makes their tools available to Ollama's tool calling |
+| `mcp_repo_server.py` | MCP server that serves the repository with the PR applied, read-only |
+| `mcp_check_server.py` | MCP server that statically checks Python (ruff) and HTML / Django templates |
+| `mcp_docs_server.py` | MCP server that searches the official Python, Django and HTML docs |
+| `mcp_scope.py` | Decides what `repo` and `check` may read (`--scope`) |
+| `fetch-docs` | Fetches the docs used by `mcp_docs_server.py` |
+| `review-mcp` / `mcp_review_server.py` | MCP server that lets other Claude Code sessions use this review CLI |
+| `jobs/run_review.sh` | Runs review.py (with MCP in the uv environment if mcp.json exists) |
 | `jobs/review.pbs` | The review job |
 | `jobs/ollama_env.sh` | Starting Ollama, pulling the model and confirming it is loaded onto the GPU |
 | `jobs/qsub_common.sh` | qsub arguments for each queue (container, GPU count, node) |
